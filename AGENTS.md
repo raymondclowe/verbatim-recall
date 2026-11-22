@@ -103,7 +103,41 @@ def build_prompt(session_id, user_text):
 * Drop the index on compaction: register `on_post_compaction` alongside `recall`, or call
   `vr._cache.clear()` from your own compaction callback.
 
-## 5. Verify — four levels, each with the command that proved it
+## 4b. Cross-session scope — decide it on purpose
+
+`VERBATIM_CROSS` defaults to `1`: the same `recall()` call also points at **other sessions on
+the host**, not just the compacted region of the current one. For an agent that has been
+working with this operator for weeks that is usually the difference between "I remember our
+conversation" and "I remember everything we have done". It also widens the trust boundary —
+content from another chat can now enter this prompt — so decide it deliberately:
+
+* **It needs a second index.** Foreign candidates come from an FTS5 table over message
+  bodies whose `rowid` is the message id (Hermes ships `messages_fts`), joined to a
+  `sessions` table with `id`, `source`, and ideally `user_id`/`title`/`last_activity_at`.
+  That index is only a **candidate generator**: bm25 narrows to `VERBATIM_CROSS_POOL`
+  (400) rows and the pool's own term statistics decide the winner. No FTS5 → the stage
+  disappears silently, which is the intended degradation.
+* **A custom `SOURCE` disables it unless you say where the store is.** Pass
+  `cross_db=<path>`; the plugin will not guess a database it was not given.
+* **Identity scoping is the safety catch.** `VERBATIM_CROSS_SAME_USER=1` (default) quotes a
+  foreign span only if it belongs to the same `user_id` as the calling session, or carries no
+  principal. On a store shared with anyone else, leave it on.
+* **…and it over-filters when the host stamps a placeholder principal.** Hermes'
+  `api_server` sessions carry the literal `user_id='api'`, so a Telegram caller cannot see
+  them. If your host does the same and you are the only operator, the honest fix is
+  `VERBATIM_CROSS_SAME_USER=0` **written host-locally with that reason**, never by deleting
+  the clause.
+* **Peers are exempt on purpose.** `VERBATIM_CROSS_TRUSTED` (default `a2a`) names sources
+  whose `user_id` is a transport detail rather than a person — the same operator's other
+  machine. Add sources here only when that is true of them.
+* **Excluded sources:** `cron` and `oneshot`, which produce machine chatter that never
+  answers a question. Override `VERBATIM_CROSS_SOURCES` when your host names channels
+  differently.
+* **The pointer carries the owner's session id, not the caller's.** If the agent passes its
+  own id to the reader it re-reads the wrong turns and concludes the pointer lies. State
+  this in the host's own instructions/skill, not only in your report.
+
+## 5. Verify — five levels, each with the command that proved it
 
 1. **Fires.** Call `recall()` with a real session id and a query about it; capture the block.
    `python verbatim_recall.py query <session_id> "<real question>"` is enough at this level.
