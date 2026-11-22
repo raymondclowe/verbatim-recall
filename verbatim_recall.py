@@ -30,6 +30,14 @@ Design rules, each learned from a matcher that fired on everything:
 No new store, no embeddings, no model calls, no writes: the archive is whatever your
 store already has, this is an in-memory index over it, and every path fails open.
 
+Cross-session: the same store also holds every *other* session on the agent, so when a
+query matches nothing in this session (or as well as what it finds here) the hook emits a
+pointer into a foreign session — carrying that session's own id, because the reader needs
+it as the handle. Foreign evidence is weaker than local evidence (the term statistics are
+computed over a candidate pool, not the whole store), so a foreign pointer is always
+labelled LOW CONFIDENCE and needs more agreement to fire. On a store with no FTS index
+the whole stage disappears and behaviour is identical to a single-session install.
+
 Sources ship for Hermes (`state.db`), generic SQLite and JSONL; pass your own callable
 to use any other store. See README.md for host setup and AGENTS.md for machine adoption.
 """
@@ -43,8 +51,9 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ---------------------------------------------------------------- knobs
 
@@ -76,6 +85,26 @@ ANNOUNCE = os.environ.get("VERBATIM_ANNOUNCE", "1") == "1"
 PREVIEW = _env_i("VERBATIM_PREVIEW", 90)      # chars of the opening ask shown in a pointer
 WINDOW = _env_i("VERBATIM_WINDOW", 20)        # suggested scroll radius for the reader
 
+# ---- cross-session (on by default; disappears silently when the store has no FTS)
+CROSS = os.environ.get("VERBATIM_CROSS", "1") == "1"
+CROSS_TOP_K = _env_i("VERBATIM_CROSS_TOP_K", 2)
+CROSS_MIN_TERMS = _env_i("VERBATIM_CROSS_MIN_TERMS", 3)     # more agreement than the local loose tier
+CROSS_SHARE = _env_f("VERBATIM_CROSS_SHARE", 0.55)          # must score within 55% of the pool's best
+CROSS_POOL = _env_i("VERBATIM_CROSS_POOL", 400)             # bm25 candidates re-scored in python
+CROSS_MAX_TERMS = _env_i("VERBATIM_CROSS_MAX_TERMS", 12)    # query terms sent to MATCH
+CROSS_COOLDOWN = _env_i("VERBATIM_CROSS_COOLDOWN", 6)       # turns before the same foreign session repeats
+CROSS_SOURCES = tuple(
+    s.strip() for s in (os.environ.get("VERBATIM_CROSS_SOURCES", "") or "").split(",") if s.strip()
+) or ("telegram", "api_server", "cli", "desktop", "mobile", "a2a")
+# Identity scoping: another person's chat on a shared store must not be quotable.
+CROSS_SAME_USER = os.environ.get("VERBATIM_CROSS_SAME_USER", "1") == "1"
+# …but a2a rows are the same operator's other machines, each with its own user_id
+# (ip:192.168.0.83), so a peer source has to stay eligible regardless of identity.
+CROSS_TRUSTED = tuple(
+    s.strip() for s in (os.environ.get("VERBATIM_CROSS_TRUSTED", "") or "").split(",") if s.strip()
+) or ("a2a",)
+
+
 _DERIVED = (
     "[CONTEXT COMPACTION",
     "[IMPORTANT: Background process",
@@ -103,6 +132,9 @@ say seems seem seemed want wants wanted need needs needed able unable possible m
 _lock = threading.Lock()
 _cache: dict = {}          # session_id -> (signature, index)
 _announced: dict = {}      # session_id -> highest id already announced
+_cross_turn: dict = {}     # session_id -> turn counter, for the foreign-pointer cooldown
+_cross_seen: dict = {}     # (session_id, foreign_session_id) -> turn last pointed at
+_fts_ok: dict = {}         # db path -> bool (does this store have messages_fts?)
 
 
 # ---------------------------------------------------------------- sources
@@ -372,6 +404,225 @@ def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None):
     return out
 
 
+# ---------------------------------------------------------------- cross-session
+#
+# Every other session on the agent lives in the same store, so a question asked here
+# can often be answered by a turn recorded there. FTS5 is already indexed by the host
+# (measured: 5 ms-15 ms for a scoped bm25 query over ~20k messages), so it is used as a
+# candidate generator only — the same idea as the local tier, one stage later: bm25
+# narrows thousands of rows to a pool, the pool's own term statistics then decide.
+#
+# Two rules make foreign evidence trustworthy enough to emit:
+#   * the pointer carries its OWNER session id — the reader needs it as the handle
+#   * it is always labelled LOW CONFIDENCE and needs more agreement than a local hit,
+#     because df is measured inside the pool, where rarity is not provable
+
+
+def _connect_ro(path: str):
+    """Read-only handle; never writes, short timeout, fails open."""
+    p = os.path.abspath(path).replace("\\", "/")
+    con = sqlite3.connect("file:" + p + "?mode=ro", uri=True, timeout=0.4)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def fts_capable(db_path: str) -> bool:
+    """True when this store has the three tables cross-session needs."""
+    if not db_path or not os.path.exists(db_path):
+        return False
+    key = (db_path, os.path.getmtime(db_path))
+    hit = _fts_ok.get(key)
+    if hit is not None:
+        return hit
+    ok = False
+    try:
+        con = _connect_ro(db_path)
+        try:
+            names = {r[0] for r in con.execute(
+                "select name from sqlite_master where type in ('table','view') "
+                "and name in ('messages_fts','messages','sessions')")}
+        finally:
+            con.close()
+        ok = names == {"messages_fts", "messages", "sessions"}
+    except Exception:
+        ok = False
+    if len(_fts_ok) > 32:
+        _fts_ok.clear()
+    _fts_ok[key] = ok
+    return ok
+
+
+def _key(term: str) -> str:
+    """A cheapstem: two words share a key when their first 6 chars agree.
+
+    Foreign turns are written days apart by a different phrasing, so exact-token
+    agreement under-counts ("rebuild" vs "rebuilt", "session" vs "sessions"). Six
+    characters keeps real stems together and keeps different words apart — no
+    dictionary, no dependency, and it is only ever used to decide agreement.
+    """
+    t = term.lower()
+    return t[:6] if len(t) > 6 else t
+
+
+def fts_query(user_message: str, max_terms: int = None) -> str:
+    """Build a safe FTS5 OR-query from the query's substantive terms.
+
+    Long terms become prefix wildcards on the cheapstem, so "rebuild" also finds
+    "rebuilt" — the pool is only a candidate generator, the scorer decides.
+    """
+    max_terms = CROSS_MAX_TERMS if max_terms is None else max_terms
+    terms = list(dict.fromkeys(tokens(user_message)))[:max(1, max_terms)]
+    if len(terms) < CROSS_MIN_TERMS:
+        return ""
+    return " OR ".join('"%s"' % (_key(t) + "*" if len(t) > 6 else t).replace('"', "")
+                       for t in terms)
+
+
+def _cross_candidates(con, query: str, exclude_session_id: str, pool: int = None,
+                      user_id: str = None):
+    """One scoped bm25 pass over every other session on this agent."""
+    pool = CROSS_POOL if pool is None else pool
+    sql = (
+        "select m.id as id, m.session_id as session_id, coalesce(m.content,'') as content,"
+        " coalesce(s.title,'') as title, coalesce(s.display_name,'') as name,"
+        " coalesce(m.timestamp, s.last_activity_at, s.started_at, 0) as ts,"
+        " bm25(messages_fts) as bm from messages_fts f"
+        " join messages m on m.id = f.rowid"
+        " left join sessions s on s.id = m.session_id"
+        " where f.messages_fts match ? and m.role in ('user','assistant')"
+        " and m.session_id <> ?"
+    )
+    args = [query, exclude_session_id]
+    if CROSS_SOURCES and CROSS_SOURCES != ("all",):
+        sql += " and coalesce(s.source,'') in (%s)" % ",".join("?" * len(CROSS_SOURCES))
+        args.extend(CROSS_SOURCES)
+    if CROSS_SAME_USER and user_id:
+        # same principal, or a row whose principal was never recorded (local CLI/API
+        # use on this host), or a trusted peer source chatting agent-to-agent.
+        sql += (" and (coalesce(s.user_id,'') = ? or coalesce(s.user_id,'') = ''"
+                + (" or coalesce(s.source,'') in (%s)" % ",".join("?" * len(CROSS_TRUSTED))
+                   if CROSS_TRUSTED else "")
+                + ")")
+        args.append(user_id)
+        args.extend(CROSS_TRUSTED)
+    sql += " order by bm25(messages_fts) limit ?"
+    args.append(pool)
+    return [dict(r) for r in con.execute(sql, args).fetchall()]
+
+
+def score_candidates(cands, user_message: str, min_terms: int = None, share: float = None):
+    """Re-score a bm25 pool with the pool's own idf and keep only strong agreement.
+
+    Two gates, both cheap and both deliberately blunt:
+      * ``min_terms`` distinct query terms must appear in the turn — one common word
+        ("drive", "update") is not evidence of anything;
+      * the turn's matched idf must reach ``share`` of the best turn in the pool — the
+        pool is already bm25-ordered, so this only removes tail noise, and it avoids
+        dividing by the whole query's idf mass (which no single turn ever covers).
+    """
+    min_terms = CROSS_MIN_TERMS if min_terms is None else min_terms
+    share = CROSS_SHARE if share is None else share
+    qterms = list(dict.fromkeys(_key(t) for t in tokens(user_message)))
+    if not cands or not qterms:
+        return []
+    toks = []
+    for c in cands:
+        body = c.get("content") or ""
+        toks.append(set() if _derived(body) else set(_key(t) for t in tokens(body)))
+    df: dict = {}
+    for ts in toks:
+        for t in set(qterms) & ts:
+            df[t] = df.get(t, 0) + 1
+    pool_n = max(1, len(cands))
+    idf = {t: math.log(1.0 + pool_n / d) for t, d in df.items()}
+    qmass = sum(idf.values()) or 1.0
+    out = []
+    for c, ts in zip(cands, toks):
+        hit = [t for t in qterms if t in ts]
+        if len(hit) < min_terms:
+            continue
+        sc = sum(idf[t] for t in hit)
+        out.append(dict(c, terms=hit, score=sc, coverage=sc / qmass))
+    if not out:
+        return []
+    out.sort(key=lambda c: -c["score"])   # stable: bm25 order survives ties
+    floor = share * out[0]["score"]
+    return [c for c in out if c["score"] >= floor]
+
+
+def _session_range(con, owner: str):
+    try:
+        r = con.execute("select min(id), max(id) from messages where session_id=?",
+                        (owner,)).fetchone()
+        if r and r[0] is not None:
+            return int(r[0]), int(r[1])
+    except Exception:
+        pass
+    return 0, 0
+
+
+def cross_hits(session_id: str, user_message: str, db_path: str = None, top_k: int = None):
+    """Spans in *other* sessions that overlap this query, one pointer per session."""
+    if not CROSS or not session_id:
+        return []
+    query = fts_query(user_message)
+    if not query:
+        return []
+    db_path = db_path or getattr(hermes_source(), "path", None)
+    if not fts_capable(db_path):
+        return []
+    top_k = CROSS_TOP_K if top_k is None else top_k
+    con = _connect_ro(db_path)
+    try:
+        try:
+            row = con.execute("select coalesce(user_id,'') as u from sessions where id = ?",
+                              (session_id,)).fetchone()
+            uid = (row["u"] if row else "") or ""
+        except Exception:
+            uid = ""
+        ranked = score_candidates(
+            _cross_candidates(con, query, session_id, user_id=uid), user_message)
+        if not ranked:
+            return []
+        best: dict = {}
+        for c in ranked:
+            best.setdefault(c["session_id"], c)          # ranked, so first wins
+        picks = list(best.values())[:max(1, top_k)]
+        for p in picks:
+            lo, hi = _session_range(con, p["session_id"])
+            p["lo"] = max(lo, int(p["id"]) - 2)
+            p["hi"] = min(hi, int(p["id"]) + 3)
+        return picks
+    finally:
+        con.close()
+
+
+def _when(ts) -> str:
+    try:
+        return time.strftime("%d %b", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+
+def _cross_line(hit, reader, qwords: list, kmap: dict) -> str:
+    title = _clean((hit.get("title") or hit.get("name") or "").strip(), 60)
+    label = hit["session_id"] + (' "%s"' % title if title else "")
+    when = _when(hit.get("ts"))
+    if when:
+        label += ", " + when
+    shown = [kmap.get(k, k) for k in hit["terms"]]
+    body = (
+        "[verbatim-recall] LOW CONFIDENCE — ANOTHER SESSION may hold this: %s, "
+        "ids %d-%d, matched %d of %d query words (%s)"
+        % (label, hit["lo"], hit["hi"], len(hit["terms"]), max(1, len(qwords)),
+           ", ".join(sorted(shown)[:5]))
+    )
+    opening = _clean(hit.get("content") or "")
+    if opening:
+        body += ' — opens: "%s"' % opening
+    return body + " -> " + reader(hit["lo"], hit["session_id"])
+
+
 # ---------------------------------------------------------------- render / hooks
 
 def recall(
@@ -381,30 +632,42 @@ def recall(
     window: int = None,
     announce: bool = None,
     reader_hint: str = None,
+    cross: bool = None,
+    cross_db: str = None,
     **kwargs,
 ):
     """Return ``{"context": "..."}`` with pointers, or None when there is nothing to say.
 
     ``reader_hint`` overrides the sentence telling the agent how to read a span back
-    (default: ``session_search(session_id=..., around_message_id=..., window=...)``).
+    (default: ``session_search(session_id=..., around_message_id=..., window=...)``);
+    it is formatted with ``session_id``/``owner_session_id`` (the session that owns the
+    span — the hook's own session, or a foreign one for a cross-session pointer),
+    ``message_id`` and ``window``.
+
+    Cross-session pointers need a store to query: they run when the source carries a
+    ``.path`` (the built-in sources do) or when ``cross_db`` names one. A caller passing
+    its own callable therefore stays single-session unless it opts in with ``cross_db``.
     """
     if QUIET or not session_id or not (user_message or "").strip():
         return None
     window = WINDOW if window is None else window
     announce = ANNOUNCE if announce is None else announce
+    cross = CROSS if cross is None else cross
     try:
         idx = index_for(session_id, source)
-        if not idx:
+        if not idx and not cross:
             return None
 
-        def reader(mid: int) -> str:
+        def reader(mid: int, owner: str = None) -> str:
+            owner = owner or session_id
             if reader_hint:
-                return reader_hint.format(session_id=session_id, message_id=mid, window=window)
-            return (f"session_search(session_id='{session_id}', "
+                return reader_hint.format(session_id=owner, owner_session_id=owner,
+                                          message_id=mid, window=window)
+            return (f"session_search(session_id='{owner}', "
                     f"around_message_id={mid}, window={window})")
 
         lines = []
-        if announce and _announced.get(session_id, 0) < idx["hi"]:
+        if idx and announce and _announced.get(session_id, 0) < idx["hi"]:
             _announced[session_id] = idx["hi"]
             lines.append(
                 f"[verbatim-recall] {idx['n']} turns of this session are summarized away but "
@@ -413,7 +676,7 @@ def recall(
             )
 
         qwords = len(set(tokens(user_message)))
-        for mid, _sc, terms, tier, _cov in match(idx, user_message):
+        for mid, _sc, terms, tier, _cov in (match(idx, user_message) if idx else []):
             role, ask = idx["preview"].get(mid, ("", ""))
             start = max(idx["lo"], mid - 2)
             span = f"ids {start}-{min(idx['hi'], mid + 3)}"
@@ -432,9 +695,45 @@ def recall(
             body += f" -> {reader(start)}"
             lines.append(body)
 
+        if cross:
+            lines.extend(_cross_lines(session_id, user_message, reader, qwords,
+                                      cross_db or getattr(source, "path", None)))
+
         return {"context": "\n".join(lines)} if lines else None
     except Exception:
         return None
+
+
+def _cross_lines(session_id: str, user_message: str, reader, qwords: int, db_path: str):
+    """Foreign pointers, cooled down so one old session cannot nag on every turn."""
+    try:
+        if not db_path:
+            return []
+        hits = cross_hits(session_id, user_message, db_path=db_path)
+        if not hits:
+            return []
+        words = list(dict.fromkeys(tokens(user_message)))
+        kmap = {}
+        for w in words:
+            kmap.setdefault(_key(w), w)
+        turn = _cross_turn.get(session_id, 0) + 1
+        _cross_turn[session_id] = turn
+        if len(_cross_turn) > 512:
+            _cross_turn.clear()
+            _cross_turn[session_id] = turn
+        if len(_cross_seen) > 4096:
+            _cross_seen.clear()
+        out = []
+        for hit in hits:
+            key = (session_id, hit["session_id"])
+            last = _cross_seen.get(key)
+            if CROSS_COOLDOWN and last is not None and turn - last < CROSS_COOLDOWN:
+                continue
+            _cross_seen[key] = turn
+            out.append(_cross_line(hit, reader, words, kmap))
+        return out
+    except Exception:
+        return []
 
 
 def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs):
@@ -477,9 +776,27 @@ def _main(argv) -> int:
             print(f"{r[0]}  n={r[1]}  ids {r[2]}-{r[3]}")
         return 0
     if len(argv) < 3:
-        print("usage: python -m verbatim_recall [sessions|index|query|explain] <session_id> [text]")
+        print("usage: python -m verbatim_recall [sessions|index|query|explain|cross] <session_id> [text]")
         return 2
     sid, rest = argv[2], " ".join(argv[3:])
+    if cmd == "cross":
+        q = fts_query(rest)
+        if not q:
+            print("query too short for cross-session (needs at least %d terms)" % CROSS_MIN_TERMS)
+            return 0
+        t0 = time.time()
+        hits = cross_hits(sid, rest, db_path=getattr(src, "path", None))
+        dt = (time.time() - t0) * 1000.0
+        print(f"match: {q}")
+        print(f"{len(hits)} foreign span(s) in {dt:.1f} ms "
+              f"(pool {CROSS_POOL}, top_k {CROSS_TOP_K}, "
+              f"min_terms {CROSS_MIN_TERMS}, share {CROSS_SHARE:.2f})")
+        for h in hits:
+            print(f"  id={h['id']} span={h['lo']}-{h['hi']} sid={h['session_id']} "
+                  f"score={h['score']:.2f} cov={h['coverage']:.2f} "
+                  f"terms={','.join(sorted(h['terms']))} when={_when(h.get('ts'))} "
+                  f"title={_clean(h.get('title') or '', 50)!r}")
+        return 0
     if cmd == "index":
         idx = index_for(sid, src)
         if not idx:

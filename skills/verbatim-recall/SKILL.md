@@ -21,6 +21,24 @@ A `pre_llm_call` hook indexes the compacted region of this session and injects 1
 * `[verbatim-recall] LOW CONFIDENCE — only 2 of 4 query words appear here (...) so this may
   be an unrelated turn` — **check, do not trust**. Cheap to dismiss, and silence would have
   been worse: a pointer missed is lost, a wrong one costs one look.
+* `[verbatim-recall] LOW CONFIDENCE — ANOTHER SESSION may hold this: <sid> "<title>", <date>,
+  ids X-Y, matched N of M query words (...) — opens: "..."` — a lead **outside this session**.
+  The session id in that line is the **owner's**, not yours: read it with
+  `session_search(session_id='<the sid in the line>', around_message_id=<X>, window=20)`.
+  Pass your own session id and you will re-read the wrong turns and conclude the pointer lies.
+
+## Reading a pointer from another session
+
+1. Copy the `session_id` **from the pointer**, not from your own context.
+2. Read the span, then judge it on its bytes. A foreign span was written days earlier under a
+   different prompt; it can be right about the fact and stale about everything around it — say
+   which part you used.
+3. It is deliberately noisier than a local pointer (it needs three agreeing words and is
+   always labelled low confidence). Dismissing one costs a line; ignoring a real one loses the
+   detail permanently.
+4. A foreign pointer is not permission to quote another person's conversation into a reply.
+   On a store shared by more than one human, identity scoping (`VERBATIM_CROSS_SAME_USER`)
+   exists for exactly that — do not "fix" a missing hit by turning it off to see more.
 
 ## What to do with a pointer
 
@@ -45,6 +63,7 @@ python __init__.py sessions                       # which regions exist, sizes, 
 python __init__.py index   <session_id>           # kept terms, rare/boilerplate cut-offs
 python __init__.py query   <session_id> "text"    # what the model would have been shown
 python __init__.py explain <session_id> "text"    # per-word df, tier, score, coverage, picked id
+python __init__.py cross   <session_id> "text"    # what OTHER sessions would be pointed at
 ```
 
 `explain` is the important one: `df=0 absent` proves a word is not in the region (that is

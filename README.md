@@ -21,6 +21,10 @@ session_search(session_id='…', around_message_id=19235, window=20).
 -> session_search(session_id='…', around_message_id=20480, window=20)
 ```
 
+Since `0.3.0` it also looks **outside the current session**: if another session on the same
+agent holds the answer, you get a louder, explicitly low-confidence pointer naming the
+*other* session's id (see [Cross-session recall](#cross-session-recall-on-by-default)).
+
 Cost: ~5 ms per turn, **0 bytes on a miss**, ~120–500 tokens when it fires.
 
 ---
@@ -66,6 +70,56 @@ so this may be an unrelated turn: ids 20482-20487 — in the turn answering: "�
 Treat that as a hint to check, not an answer. It still needs two agreeing words (or one
 word rare enough to be an identifier), and only one low-confidence pointer is allowed
 per turn, so it cannot flood the window.
+
+---
+
+## Cross-session recall (on by default)
+
+A compaction summary is per-session, but a real agent runs many sessions: one per Telegram
+topic, one per API client, one per scheduled job. A fact learned in November's chat is
+usually the answer to December's question, and the current session's own region knows
+nothing about it. So `0.3.0` also queries **every other session on the same agent** and
+emits a pointer when one of them matches the current turn — whether or not the local
+region matched too:
+
+```
+[verbatim-recall] LOW CONFIDENCE — ANOTHER SESSION may hold this: 20261109_093808_ca1f280e
+"Salvage RAM and hard drive from old HP ProBook", 09 Nov, ids 18902-18907,
+matched 3 of 3 query words (probook, rebuilt, ubuntu)
+— opens: "# Plan: wipe probook → Ubuntu Server 24.04, hostname PR1 …"
+-> session_search(session_id='20261109_093808_ca1f280e', around_message_id=18902, window=20)
+```
+
+Four properties make that pointer trustworthy enough to inject:
+
+| Property | Why |
+|---|---|
+| **The pointer carries the owner's session id**, not yours | the reader needs the foreign id as its handle, or the span is unreachable |
+| **Always `LOW CONFIDENCE`, and it needs 3 agreeing words** (not 2) | a foreign turn was written days apart, in different words, by a different prompt; equal evidence would be over-trust |
+| **Scored on the pool's own term statistics, gated relative to the pool's best** | a global IDF over the whole store would rank the loudest session, not the most relevant one |
+| **It shows the opening of the span** (`— opens: "…"`) | one line lets the model judge relevance without spending a read |
+
+Cost: one scoped FTS query plus a re-score, measured at **5–40 ms per turn** on a 20k-message
+store, **0 bytes injected on a miss**, and a cooldown (`VERBATIM_CROSS_COOLDOWN`, 6 turns per
+foreign session) so the same old session cannot be re-advertised every turn.
+
+### Who is in scope
+
+Cross-session recall widens the trust boundary: content from *other* conversations enters the
+prompt. Only sessions whose `source` is in `VERBATIM_CROSS_SOURCES` are eligible
+(default: `telegram, api_server, cli, desktop, mobile, a2a` — automation sources like `cron`
+and `oneshot` are excluded, because scheduled jobs are noisy and rarely worth quoting).
+
+On top of that, **identity scoping is on by default** (`VERBATIM_CROSS_SAME_USER=1`): a
+foreign row is eligible only when its `user_id` equals the asking session's, or was never
+recorded, **or** its source is a trusted peer (`VERBATIM_CROSS_TRUSTED`, default `a2a` —
+agent-to-agent rows belong to the same operator's other machines, each with its own
+`user_id`, so identity scoping would otherwise hide the one source you explicitly wanted).
+
+If your store is single-operator and you want maximum recall, set
+`VERBATIM_CROSS_SAME_USER=0` — you then see your own API/CLI sessions from a chat session.
+Leave it at `1` on any deployment where two people talk to the same agent: it is the only
+thing stopping one person's chat being quoted into another person's prompt.
 
 ---
 
@@ -120,6 +174,7 @@ python verbatim_recall.py sessions                      # which regions exist
 python verbatim_recall.py index   <session_id>          # what the index kept
 python verbatim_recall.py query   <session_id> "did the probook rebuild work"
 python verbatim_recall.py explain <session_id> "op3 local model context"
+python verbatim_recall.py cross   <session_id> "probook rebuilt ubuntu"   # foreign sessions
 ```
 
 `explain` prints per-word document frequency (`df=0 absent` = the word is not in the
@@ -141,6 +196,19 @@ for debugging a miss *and* for choosing negative controls that are actually nega
 If your framework **discards** verbatim turns at compaction instead of marking them,
 there is nothing to reclaim: fix retention first (keep rows, set a `compacted` flag, or
 append to a JSONL archive). This tool is deliberately not a transcript writer.
+
+Cross-session recall (`VERBATIM_CROSS=1`, the default) needs two more things, and simply
+switches itself off when they are absent:
+
+1. an **FTS5 index** over the message bodies with `rowid` = message id (Hermes' `state.db`
+   ships `messages_fts` for free) — it is only a *candidate generator*; the scoring is done
+   in Python on the returned pool, so a small or crude index still works;
+2. a **`sessions` table** with `id`, `source`, and optionally `user_id`, `chat_id`, `title`,
+   `last_activity_at` — used for scope, for the date, for the human title in the pointer, and
+   as the reader's handle. On stores without it, pass your own candidate callable.
+
+If you bring your own source callable, cross-session recall is off unless you also pass
+`cross_db=<path to the store>` — the plugin will not guess a database it was not given.
 
 ---
 
@@ -167,6 +235,15 @@ compacted region and are meant to be a starting point, not a law.
 | `VERBATIM_WINDOW` | `20` | suggested scroll radius handed to the reader |
 | `VERBATIM_ANNOUNCE` | `1` | emit the ids-range line once per region growth |
 | `VERBATIM_QUIET` | `0` | `1` = index only, never inject |
+| `VERBATIM_CROSS` | `1` | `1` = also point at other sessions on the same agent |
+| `VERBATIM_CROSS_SOURCES` | `telegram,api_server,cli,desktop,mobile,a2a` | session sources eligible for cross-session recall |
+| `VERBATIM_CROSS_SAME_USER` | `1` | only recall sessions belonging to the same principal |
+| `VERBATIM_CROSS_TRUSTED` | `a2a` | sources exempt from the identity check (peers have their own ids) |
+| `VERBATIM_CROSS_TOP_K` | `2` | foreign pointers per turn |
+| `VERBATIM_CROSS_MIN_TERMS` | `3` | agreeing words required — one more than the local tier |
+| `VERBATIM_CROSS_SHARE` | `0.55` | matched IDF mass as a share of the pool's best turn |
+| `VERBATIM_CROSS_POOL` | `400` | candidate turns pulled from the FTS index before re-scoring |
+| `VERBATIM_CROSS_COOLDOWN` | `6` | turns before the same foreign session may be pointed at again |
 
 **Too many weak pointers?** Raise `VERBATIM_COVERAGE` to 0.55, then `VERBATIM_MIN_SCORE`.
 Widen `VERBATIM_BOILER_DF` if your region is small. **Missing things?** Lower
@@ -184,6 +261,11 @@ tier, so the trustworthy pointers stay untouched.
    words that are genuinely absent (`explain` shows `df=0`). Nonsense words only: any real
    word you use in a test enters the archive and stops being a control.
 4. **Silence is the default** — non-matching queries inject 0 bytes.
+5. **The crossing points** — ask a session about work done in another session and confirm the
+   pointer names the *other* session's id, and that `session_search(session_id='<that id>',
+   around_message_id=<lo>)` returns the turn the pointer promised. Then confirm a second
+   session belonging to a different `user_id` is **not** quoted (`cross_hits` in
+   `tests/test_cross.py` covers both, with a synthetic stranger session as the control).
 
 ```bash
 python -m unittest discover -s tests -v      # the gate itself, no DB needed
@@ -200,7 +282,17 @@ not deploying it — plugin modules are imported once at start.
   A query phrased in words absent from the region yields nothing; that is what the loose
   tier and, ultimately, a better query are for.
 * English-centric stopword list; other languages mostly work by falling through to rare terms.
-* one session at a time — no cross-session search (feed a session id, get that region).
+* cross-session recall is a **lexical prefilter over an FTS index**, not a semantic search: it
+  finds sessions that share your words, which is not the same as sessions that answer your
+  question. It also cannot tell that two sessions are about the same *project* when the words
+  differ, and a foreign pointer costs ~200 extra tokens whenever it fires alongside a local one.
+* the cheapstem is a 6-character prefix, not a stemmer: `session`/`sessions` match (intended),
+  `server`/`serves` also match (harmless in practice, wrong in principle).
+* a foreign pointer is a **dangling pointer risk**: if the owning session is pruned or deleted,
+  the id no longer resolves. The label names the owner so a failed read is diagnosable.
+* identity scoping compares `user_id` strings; a store that stamps a shared placeholder
+  (`api` for every API client, for instance) cannot separate two humans by itself — set
+  `VERBATIM_CROSS_SAME_USER=0` deliberately, or fix the stamps upstream.
 * the archive's coherence is the framework's job; if rows are missing, pointers are missing.
 * no reranking of the matched span's content: the top-1 id is chosen by the gate, not by a
   second model pass.
