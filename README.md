@@ -77,7 +77,7 @@ Single file, stdlib only, Python 3.9+. Pick the row that matches your host.
 
 ```bash
 mkdir -p "$HERMES_HOME/plugins/verbatim-recall"      # Windows: %LOCALAPPDATA%\hermes\plugins\...
-curl -fsSL https://raw.githubusercontent.com/OWNER/verbatim-recall/main/verbatim_recall.py \
+curl -fsSL https://raw.githubusercontent.com/raymondclowe/verbatim-recall/main/verbatim_recall.py \
   -o "$HERMES_HOME/plugins/verbatim-recall/__init__.py"
 hermes plugins enable verbatim-recall
 # the module is imported at gateway start — restart the gateway, or `hermes plugins enable`

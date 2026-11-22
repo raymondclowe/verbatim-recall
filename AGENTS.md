@@ -66,9 +66,9 @@ system to reach mode A.
 Single file, stdlib only, Python 3.9+.
 
 ```bash
-git clone https://github.com/OWNER/verbatim-recall /tmp/verbatim-recall
+git clone https://github.com/raymondclowe/verbatim-recall /tmp/verbatim-recall
 # or, no git:
-curl -fsSL https://raw.githubusercontent.com/OWNER/verbatim-recall/main/verbatim_recall.py -o verbatim_recall.py
+curl -fsSL https://raw.githubusercontent.com/raymondclowe/verbatim-recall/main/verbatim_recall.py -o verbatim_recall.py
 ```
 
 * **Hermes**: copy it to `$HERMES_HOME/plugins/verbatim-recall/__init__.py` (Windows:
