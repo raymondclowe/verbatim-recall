@@ -1,0 +1,5 @@
+# keep the module byte-identical across platforms: agents are told to compare a
+# sha256 after install, and CRLF checkout conversion would make that comparison lie
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
