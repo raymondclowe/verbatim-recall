@@ -71,6 +71,9 @@ how you choose a valid negative control), `common` means it was down-weighted, a
 `picked 0` on a query that should have matched means the coverage bar is too high for this
 region's vocabulary.
 
+The full design — candidate SQL, both gates, the identity-scoping rules, the cost model and
+what is still unresolved — is in `references/cross-session-recall.md`.
+
 ## Two traps
 
 * **Editing `__init__.py` is not deploying it.** The gateway imports the module at start;
