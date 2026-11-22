@@ -150,6 +150,11 @@ content from another chat can now enter this prompt — so decide it deliberatel
    own test text enters the archive and stops being negative.
 4. **Live.** Confirm the *running* process emits the block (a real turn, or a deliberate
    restart you were permitted to do). State plainly which of the two it was.
+5. **Written where the next agent looks.** Put the adopted mode, store path, knob values and
+   the two facts that cost time here (the pointer carries the *owner's* session id; `compacted`
+   is per live session, not global) into the host's own instructions or skill, then re-read the
+   rendered file. Verification that lives only in a chat message dies at the next compaction —
+   that is exactly how the same investigation gets bought twice.
 
 ## 6. Tune, then hand back
 
@@ -167,7 +172,7 @@ Adopted: <mode A/B/C/D> — <one line>
 Store: <path> (<rows> compacted rows, ids X-Y, session <id>)
 Hook: <where it now runs>
 Reader: <the tool call a pointer hands the model>
-Proved: 1) fires: <output snippet>  2) bytes: id N == <sha/size>  3) top-1 + silence: <n>/<n>, controls silent  4) live: yes/no — <how>
+Proved: 1) fires: <output snippet>  2) bytes: id N == <sha/size>  3) top-1 + silence: <n>/<n>, controls silent  4) live: yes/no — <how>  5) written: <file> sha <12 hex>
 Skipped: <what and why>
 Knobs changed: <name=value, why>
 Risk left: <e.g. gateway restart pending, or loose tier untested in normal use>
