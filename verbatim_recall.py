@@ -53,56 +53,194 @@ import sys
 import threading
 import time
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-# ---------------------------------------------------------------- knobs
+# ---------------------------------------------------------------- config
+#
+# Every knob is a YAML item under ``plugins.entries.verbatim-recall.settings`` in
+# the Hermes ``config.yaml``; ``plugin.yaml`` declares the schema, so
+# ``hermes plugins`` renders the fields and writes them back to the same place.
+# There are no environment variables — one source of truth, visible and editable.
+# On a host without a plugin context, call ``configure({...})`` before use.
 
-def _env_f(name, default):
+DEFAULTS: dict = {
+    "db_path": None,                    # Hermes state DB; default <hermes home>/state.db
+    "quiet": False,                     # index only, never inject
+    "announce": True,                   # the ids-range line, once per region growth
+    "top_k": 2,                         # strict pointers per turn
+    "min_score": 1.6,                   # absolute floor for a strict hit
+    "coverage": 0.45,                   # share of the query's IDF mass a strict hit carries
+    "min_terms": 2,                     # agreeing terms needed for a strict hit
+    "loose_score": 0.9,                 # floor for the LOW CONFIDENCE tier
+    "loose_coverage": 0.20,
+    "loose_top_k": 1,
+    "common_weight": 0.3,               # weight of non-rare terms in the loose tier
+    "span": 24,                         # min id distance between two pointers
+    "preview": 90,                      # chars of the opening ask quoted in a pointer
+    "window": 20,                       # suggested scroll radius handed to the reader
+    "boiler_df": 0,                     # 0 = derive; else a term in more than N rows is boilerplate
+    "rare_df": 0,                       # 0 = derive; else a term in at most N rows is rare
+    "cross_session.enabled": True,      # also point at other sessions on the same agent
+    "cross_session.top_k": 2,           # foreign pointers per turn
+    "cross_session.min_terms": 3,       # one more agreeing word than the local tier
+    "cross_session.share": 0.55,        # matched IDF mass, as a share of the pool's best turn
+    "cross_session.pool": 400,          # bm25 candidates re-scored in python
+    "cross_session.max_terms": 12,      # query terms sent to MATCH
+    "cross_session.cooldown": 6,        # turns before the same foreign session repeats
+    "cross_session.sources": ["telegram", "api_server", "cli", "desktop", "mobile", "a2a"],
+    # Identity scoping. On by default: a shared state.db must never quote another person's
+    # chat, so only rows whose principal matches the caller, whose principal is listed in
+    # ``trusted_principals`` (the operator's own API surface), whose principal was never
+    # recorded, or whose source is in ``trusted_sources`` can be quoted. A single-operator
+    # store sees everything that is his; set it false to drop even that check.
+    "cross_session.same_user_only": True,
+    # Principals that are the operator's own non-chat surfaces: ``api`` is what the local
+    # api_server records, so turns typed into the API are quotable from Telegram.
+    "cross_session.trusted_principals": ["api"],
+    # a2a rows are the same operator's other machines, each with its own user_id (ip:…)
+    "cross_session.trusted_sources": ["a2a"],
+}
+
+CONFIG: dict = dict(DEFAULTS)   # active settings, dotted keys as declared above
+
+
+def _as_bool(value, default=False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+    return bool(default)
+
+
+def _as_int(value, default) -> int:
     try:
-        return float(os.environ.get(name, "") or default)
-    except ValueError:
-        return float(default)
-
-
-def _env_i(name, default):
-    try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
+        return int(value)
+    except (TypeError, ValueError):
         return int(default)
 
 
-QUIET = os.environ.get("VERBATIM_QUIET", "0") == "1"
-TOP_K = _env_i("VERBATIM_TOP_K", 2)
-MIN_SCORE = _env_f("VERBATIM_MIN_SCORE", 1.6)
-COVERAGE = _env_f("VERBATIM_COVERAGE", 0.45)
-MIN_TERMS = _env_i("VERBATIM_MIN_TERMS", 2)
-LOOSE_SCORE = _env_f("VERBATIM_LOOSE_SCORE", 0.9)
-LOOSE_COVERAGE = _env_f("VERBATIM_LOOSE_COVERAGE", 0.20)
-LOOSE_TOP_K = _env_i("VERBATIM_LOOSE_TOP_K", 1)
-COMMON_W = _env_f("VERBATIM_COMMON_WEIGHT", 0.3)
-SPAN = _env_i("VERBATIM_SPAN", 24)
-ANNOUNCE = os.environ.get("VERBATIM_ANNOUNCE", "1") == "1"
-PREVIEW = _env_i("VERBATIM_PREVIEW", 90)      # chars of the opening ask shown in a pointer
-WINDOW = _env_i("VERBATIM_WINDOW", 20)        # suggested scroll radius for the reader
+def _as_float(value, default) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
-# ---- cross-session (on by default; disappears silently when the store has no FTS)
-CROSS = os.environ.get("VERBATIM_CROSS", "1") == "1"
-CROSS_TOP_K = _env_i("VERBATIM_CROSS_TOP_K", 2)
-CROSS_MIN_TERMS = _env_i("VERBATIM_CROSS_MIN_TERMS", 3)     # more agreement than the local loose tier
-CROSS_SHARE = _env_f("VERBATIM_CROSS_SHARE", 0.55)          # must score within 55% of the pool's best
-CROSS_POOL = _env_i("VERBATIM_CROSS_POOL", 400)             # bm25 candidates re-scored in python
-CROSS_MAX_TERMS = _env_i("VERBATIM_CROSS_MAX_TERMS", 12)    # query terms sent to MATCH
-CROSS_COOLDOWN = _env_i("VERBATIM_CROSS_COOLDOWN", 6)       # turns before the same foreign session repeats
-CROSS_SOURCES = tuple(
-    s.strip() for s in (os.environ.get("VERBATIM_CROSS_SOURCES", "") or "").split(",") if s.strip()
-) or ("telegram", "api_server", "cli", "desktop", "mobile", "a2a")
-# Identity scoping: another person's chat on a shared store must not be quotable.
-CROSS_SAME_USER = os.environ.get("VERBATIM_CROSS_SAME_USER", "1") == "1"
-# …but a2a rows are the same operator's other machines, each with its own user_id
-# (ip:192.168.0.83), so a peer source has to stay eligible regardless of identity.
-CROSS_TRUSTED = tuple(
-    s.strip() for s in (os.environ.get("VERBATIM_CROSS_TRUSTED", "") or "").split(",") if s.strip()
-) or ("a2a",)
+
+def _as_list(value, default) -> list:
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = [str(part).strip() for part in value if str(part).strip()]
+    else:
+        items = []
+    return items or list(default)
+
+
+# ---- the module globals the rest of this file reads; all set by _apply()
+QUIET = False
+ANNOUNCE = True
+TOP_K = 2
+MIN_SCORE = 1.6
+COVERAGE = 0.45
+MIN_TERMS = 2
+LOOSE_SCORE = 0.9
+LOOSE_COVERAGE = 0.20
+LOOSE_TOP_K = 1
+COMMON_W = 0.3
+SPAN = 24
+PREVIEW = 90
+WINDOW = 20
+CROSS = True
+CROSS_TOP_K = 2
+CROSS_MIN_TERMS = 3
+CROSS_SHARE = 0.55
+CROSS_POOL = 400
+CROSS_MAX_TERMS = 12
+CROSS_COOLDOWN = 6
+CROSS_SOURCES = ("telegram", "api_server", "cli", "desktop", "mobile", "a2a")
+CROSS_SAME_USER = True
+CROSS_TRUSTED = ("a2a",)
+CROSS_TRUSTED_PRINCIPALS = ("api",)
+
+
+def _apply() -> None:
+    """Project ``CONFIG`` onto the module globals the index and matcher read."""
+    global QUIET, ANNOUNCE, TOP_K, MIN_SCORE, COVERAGE, MIN_TERMS
+    global LOOSE_SCORE, LOOSE_COVERAGE, LOOSE_TOP_K, COMMON_W, SPAN, PREVIEW, WINDOW
+    global CROSS, CROSS_TOP_K, CROSS_MIN_TERMS, CROSS_SHARE, CROSS_POOL
+    global CROSS_MAX_TERMS, CROSS_COOLDOWN, CROSS_SOURCES, CROSS_SAME_USER, CROSS_TRUSTED
+    global CROSS_TRUSTED_PRINCIPALS
+    cfg = CONFIG
+    QUIET = _as_bool(cfg.get("quiet"), DEFAULTS["quiet"])
+    ANNOUNCE = _as_bool(cfg.get("announce"), DEFAULTS["announce"])
+    TOP_K = _as_int(cfg.get("top_k"), DEFAULTS["top_k"])
+    MIN_SCORE = _as_float(cfg.get("min_score"), DEFAULTS["min_score"])
+    COVERAGE = _as_float(cfg.get("coverage"), DEFAULTS["coverage"])
+    MIN_TERMS = _as_int(cfg.get("min_terms"), DEFAULTS["min_terms"])
+    LOOSE_SCORE = _as_float(cfg.get("loose_score"), DEFAULTS["loose_score"])
+    LOOSE_COVERAGE = _as_float(cfg.get("loose_coverage"), DEFAULTS["loose_coverage"])
+    LOOSE_TOP_K = _as_int(cfg.get("loose_top_k"), DEFAULTS["loose_top_k"])
+    COMMON_W = _as_float(cfg.get("common_weight"), DEFAULTS["common_weight"])
+    SPAN = _as_int(cfg.get("span"), DEFAULTS["span"])
+    PREVIEW = _as_int(cfg.get("preview"), DEFAULTS["preview"])
+    WINDOW = _as_int(cfg.get("window"), DEFAULTS["window"])
+    CROSS = _as_bool(cfg.get("cross_session.enabled"), DEFAULTS["cross_session.enabled"])
+    CROSS_TOP_K = _as_int(cfg.get("cross_session.top_k"), DEFAULTS["cross_session.top_k"])
+    CROSS_MIN_TERMS = _as_int(cfg.get("cross_session.min_terms"), DEFAULTS["cross_session.min_terms"])
+    CROSS_SHARE = _as_float(cfg.get("cross_session.share"), DEFAULTS["cross_session.share"])
+    CROSS_POOL = _as_int(cfg.get("cross_session.pool"), DEFAULTS["cross_session.pool"])
+    CROSS_MAX_TERMS = _as_int(cfg.get("cross_session.max_terms"), DEFAULTS["cross_session.max_terms"])
+    CROSS_COOLDOWN = _as_int(cfg.get("cross_session.cooldown"), DEFAULTS["cross_session.cooldown"])
+    CROSS_SOURCES = tuple(_as_list(cfg.get("cross_session.sources"), DEFAULTS["cross_session.sources"]))
+    CROSS_SAME_USER = _as_bool(cfg.get("cross_session.same_user_only"),
+                               DEFAULTS["cross_session.same_user_only"])
+    CROSS_TRUSTED = tuple(_as_list(cfg.get("cross_session.trusted_sources"),
+                                   DEFAULTS["cross_session.trusted_sources"]))
+    CROSS_TRUSTED_PRINCIPALS = tuple(
+        _as_list(cfg.get("cross_session.trusted_principals"),
+                 DEFAULTS["cross_session.trusted_principals"]))
+
+
+def configure(overrides=None) -> dict:
+    """Adopt ``overrides`` (dotted settings keys) on top of the defaults.
+
+    Unknown keys are reported on stderr and ignored, so a typo in config.yaml is
+    visible instead of silently doing nothing. Returns the effective settings.
+    """
+    merged = dict(DEFAULTS)
+    for key, value in dict(overrides or {}).items():
+        name = str(key).strip()
+        if name in DEFAULTS:
+            merged[name] = value
+        elif name:
+            print(f"verbatim-recall: ignoring unknown setting {name!r}", file=sys.stderr)
+    CONFIG.clear()
+    CONFIG.update(merged)
+    _apply()
+    return dict(CONFIG)
+
+
+def settings_from_context(ctx) -> dict:
+    """Read every declared setting from a Hermes plugin context (never raises)."""
+    getter = getattr(ctx, "get_config", None)
+    if not callable(getter):
+        return {}
+    found = {}
+    for key, default in DEFAULTS.items():
+        try:
+            found[key] = getter(key, default)
+        except Exception:
+            found[key] = default
+    return found
+
+
+_apply()
 
 
 _DERIVED = (
@@ -156,7 +294,7 @@ def _hermes_home() -> str:
 
 def hermes_source(db_path: str | None = None):
     """Default source: a Hermes ``state.db`` (``messages`` table, ``compacted=1``)."""
-    path = db_path or os.environ.get("VERBATIM_DB") or os.path.join(_hermes_home(), "state.db")
+    path = db_path or CONFIG.get("db_path") or os.path.join(_hermes_home(), "state.db")
 
     def source(session_id: str):
         con = sqlite3.connect(path, timeout=3)
@@ -285,8 +423,8 @@ def build_index(rows):
     # boilerplate: a term nearly every substantive message carries is not evidence
     # (measured on a real region: boilerplate sits above ~10% df, topical words at
     #  1-5% — so precision must come from query coverage, not a tight rarity cut)
-    boiler_df = _env_i("VERBATIM_BOILER_DF", 0) or max(12, int(n * 0.10))
-    rare_df = _env_i("VERBATIM_RARE_DF", 0) or max(8, int(n * 0.05))
+    boiler_df = _as_int(CONFIG.get("boiler_df"), 0) or max(12, int(n * 0.10))
+    rare_df = _as_int(CONFIG.get("rare_df"), 0) or max(8, int(n * 0.05))
     inv = {t: ids for t, ids in inv.items() if len(ids) <= boiler_df}
     idf = {t: math.log(1.0 + n / len(ids)) for t, ids in inv.items()}
     return {
@@ -498,13 +636,19 @@ def _cross_candidates(con, query: str, exclude_session_id: str, pool: int = None
         args.extend(CROSS_SOURCES)
     if CROSS_SAME_USER and user_id:
         # same principal, or a row whose principal was never recorded (local CLI/API
-        # use on this host), or a trusted peer source chatting agent-to-agent.
-        sql += (" and (coalesce(s.user_id,'') = ? or coalesce(s.user_id,'') = ''"
-                + (" or coalesce(s.source,'') in (%s)" % ",".join("?" * len(CROSS_TRUSTED))
-                   if CROSS_TRUSTED else "")
-                + ")")
+        # use on this host), or a principal/source the operator declared his own
+        # (`api` = the local api_server surface, `a2a` = another machine of his).
+        ors = ["coalesce(s.user_id,'') = ?", "coalesce(s.user_id,'') = ''"]
         args.append(user_id)
-        args.extend(CROSS_TRUSTED)
+        if CROSS_TRUSTED_PRINCIPALS:
+            ors.append("coalesce(s.user_id,'') in (%s)"
+                       % ",".join("?" * len(CROSS_TRUSTED_PRINCIPALS)))
+            args.extend(CROSS_TRUSTED_PRINCIPALS)
+        if CROSS_TRUSTED:
+            ors.append("coalesce(s.source,'') in (%s)"
+                       % ",".join("?" * len(CROSS_TRUSTED)))
+            args.extend(CROSS_TRUSTED)
+        sql += " and (" + " or ".join(ors) + ")"
     sql += " order by bm25(messages_fts) limit ?"
     args.append(pool)
     return [dict(r) for r in con.execute(sql, args).fetchall()]
@@ -749,7 +893,8 @@ def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs)
 
 
 def register(ctx) -> None:
-    """Hermes plugin entry point: ``ctx.register_hook(name, fn)``."""
+    """Hermes plugin entry point: adopt the YAML settings, then hook."""
+    configure(settings_from_context(ctx))
     ctx.register_hook("pre_llm_call", recall)
     ctx.register_hook("post_compaction", on_post_compaction)
 
@@ -762,7 +907,7 @@ def _main(argv) -> int:
     if cmd == "sessions":
         path = getattr(src, "path", None)
         if not path or not os.path.exists(path):
-            print(f"no store at {path} — set VERBATIM_DB")
+            print(f"no store at {path} — set plugins.entries.verbatim-recall.settings.db_path")
             return 1
         con = sqlite3.connect(path, timeout=3)
         try:

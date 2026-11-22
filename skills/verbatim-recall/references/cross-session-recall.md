@@ -125,6 +125,6 @@ owner* were missing.
 
 - Whether cooldown should be per-session-family rather than per-session-id.
 - Whether `api_server` should stamp the operator id instead of the literal `api`; until it does, same-user
-  scoping cannot reach API sessions from Telegram, and the honest workaround is a host-local
-  `VERBATIM_CROSS_SAME_USER=0` on a single-operator store, documented rather than silent.
+  scoping cannot reach API sessions from Telegram, and the honest workaround is
+  `cross_session.same_user_only: false` on a single-operator store, documented rather than silent.
 - Content preview in a foreign pointer: decided yes — it already prints `— opens: "..."`.

@@ -1,5 +1,175 @@
 name: verbatim-recall
-version: 0.3.0
+version: 0.4.0
 description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Silent otherwise."
 author: Hermes Agent
 license: MIT
+
+# Every knob of this plugin is a YAML item here and nowhere else. Values are written to
+# config.yaml under plugins.entries.verbatim-recall.settings (a dotted key becomes a nested
+# mapping) and are read back with ctx.get_config("<key>"). The module keeps the same
+# defaults when it is imported outside Hermes (tests, CLI), so nothing depends on how it
+# is loaded.
+config_schema:
+  db_path:
+    type: str
+    default: null
+    label: State database
+    description: "Path to the Hermes state.db to index. Empty = <HERMES_HOME>/state.db."
+
+  # ---- current-session recall -------------------------------------------------
+  quiet:
+    type: bool
+    default: false
+    label: Quiet
+    description: "Suppress the CLI's diagnostic lines."
+
+  announce:
+    type: bool
+    default: true
+    label: Announce the index
+    description: "Say on the first turn how many summarized-away turns are searchable."
+
+  top_k:
+    type: int
+    default: 2
+    label: Spans per hit
+    description: "How many adjacent id spans to offer for one matched turn."
+
+  min_score:
+    type: float
+    default: 1.6
+    label: Minimum score
+    description: "Strict gate: idf-weighted score a turn must reach to be quoted."
+
+  coverage:
+    type: float
+    default: 0.45
+    label: Minimum coverage
+    description: "Strict gate: fraction of the query's rare words that must appear in the turn."
+
+  min_terms:
+    type: int
+    default: 2
+    label: Minimum query terms
+    description: "Distinct rare words a query needs before this plugin will look at all."
+
+  loose_score:
+    type: float
+    default: 0.9
+    label: Loose minimum score
+    description: "Second pass, labelled LOW CONFIDENCE — a partial match, not a certainty."
+
+  loose_coverage:
+    type: float
+    default: 0.20
+    label: Loose minimum coverage
+    description: "Second pass coverage floor; lower than the strict gate on purpose."
+
+  loose_top_k:
+    type: int
+    default: 1
+    label: Loose spans per hit
+    description: "Spans offered by the low-confidence pass."
+
+  common_weight:
+    type: float
+    default: 0.3
+    label: Common-word weight
+    description: "How much a query word that is common in the corpus still counts."
+
+  span:
+    type: int
+    default: 24
+    label: Span width
+    description: "Messages on each side of a hit when reading a span back."
+
+  preview:
+    type: int
+    default: 90
+    label: Preview length
+    description: "Characters of the matched turn shown in the pointer line."
+
+  window:
+    type: int
+    default: 20
+    label: Session-search window
+    description: "Default window handed to session_search in the pointer."
+
+  boiler_df:
+    type: int
+    default: 0
+    label: Boilerplate threshold
+    description: "A word in more than N messages is boilerplate and never a keyword. 0 = derive."
+
+  rare_df:
+    type: int
+    default: 0
+    label: Rare-word threshold
+    description: "A word in at most N messages counts as rare. 0 = derive."
+
+  # ---- cross-session recall ---------------------------------------------------
+  cross_session.enabled:
+    type: bool
+    default: true
+    label: Cross-session recall
+    description: "Also surface spans from OTHER sessions on this store, as a foreign pointer."
+
+  cross_session.top_k:
+    type: int
+    default: 2
+    label: Cross-session spans
+    description: "Foreign pointers offered per turn."
+
+  cross_session.min_terms:
+    type: int
+    default: 3
+    label: Cross-session min terms
+    description: "Stricter than the local gate: distinct rare words a query needs."
+
+  cross_session.share:
+    type: float
+    default: 0.55
+    label: Cross-session coverage
+    description: "Fraction of the query's rare words a foreign span must contain."
+
+  cross_session.pool:
+    type: int
+    default: 400
+    label: Candidate pool
+    description: "Foreign turns fetched per query before scoring."
+
+  cross_session.max_terms:
+    type: int
+    default: 12
+    label: Max query terms
+    description: "Maximum query words used for the foreign fingerprint match."
+
+  cross_session.cooldown:
+    type: int
+    default: 6
+    label: Cooldown turns
+    description: "Turns to wait before repeating the same foreign pointer."
+
+  cross_session.sources:
+    type: list
+    default: ["telegram", "api_server", "cli", "desktop", "mobile", "a2a"]
+    label: Sources
+    description: "Session sources eligible for foreign pointers. cron/oneshot are excluded."
+
+  cross_session.same_user_only:
+    type: bool
+    default: true
+    label: Same operator only
+    description: "Only quote foreign rows whose principal is the caller, was never recorded, or is declared trusted below."
+
+  cross_session.trusted_principals:
+    type: list
+    default: ["api"]
+    label: Trusted principals
+    description: "Extra principals treated as this operator: 'api' is the local api_server surface."
+
+  cross_session.trusted_sources:
+    type: list
+    default: ["a2a"]
+    label: Trusted sources
+    description: "Sources quoted whatever the principal — another machine of the same operator."

@@ -37,7 +37,7 @@ A `pre_llm_call` hook indexes the compacted region of this session and injects 1
    always labelled low confidence). Dismissing one costs a line; ignoring a real one loses the
    detail permanently.
 4. A foreign pointer is not permission to quote another person's conversation into a reply.
-   On a store shared by more than one human, identity scoping (`VERBATIM_CROSS_SAME_USER`)
+   On a store shared by more than one human, identity scoping (`cross_session.same_user_only`)
    exists for exactly that — do not "fix" a missing hit by turning it off to see more.
 
 ## What to do with a pointer

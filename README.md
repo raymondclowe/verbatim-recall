@@ -100,26 +100,29 @@ Four properties make that pointer trustworthy enough to inject:
 | **It shows the opening of the span** (`— opens: "…"`) | one line lets the model judge relevance without spending a read |
 
 Cost: one scoped FTS query plus a re-score, measured at **5–40 ms per turn** on a 20k-message
-store, **0 bytes injected on a miss**, and a cooldown (`VERBATIM_CROSS_COOLDOWN`, 6 turns per
+store, **0 bytes injected on a miss**, and a cooldown (`cross_session.cooldown`, 6 turns per
 foreign session) so the same old session cannot be re-advertised every turn.
 
 ### Who is in scope
 
 Cross-session recall widens the trust boundary: content from *other* conversations enters the
-prompt. Only sessions whose `source` is in `VERBATIM_CROSS_SOURCES` are eligible
+prompt. Only sessions whose `source` is in `cross_session.sources` are eligible
 (default: `telegram, api_server, cli, desktop, mobile, a2a` — automation sources like `cron`
 and `oneshot` are excluded, because scheduled jobs are noisy and rarely worth quoting).
 
-On top of that, **identity scoping is on by default** (`VERBATIM_CROSS_SAME_USER=1`): a
+On top of that, **identity scoping is on by default** (`cross_session.same_user_only: true`): a
 foreign row is eligible only when its `user_id` equals the asking session's, or was never
-recorded, **or** its source is a trusted peer (`VERBATIM_CROSS_TRUSTED`, default `a2a` —
+recorded, **or** its source is a trusted peer (`cross_session.trusted_sources`, default `a2a` —
 agent-to-agent rows belong to the same operator's other machines, each with its own
-`user_id`, so identity scoping would otherwise hide the one source you explicitly wanted).
+`user_id`, so identity scoping would otherwise hide the one source you explicitly wanted),
+**or** its principal is one of `cross_session.trusted_principals` (default `api` — the local
+API surface is this operator by definition; without it, a Telegram session never sees the
+agent's own API sessions, which is the whole point of the feature).
 
-If your store is single-operator and you want maximum recall, set
-`VERBATIM_CROSS_SAME_USER=0` — you then see your own API/CLI sessions from a chat session.
-Leave it at `1` on any deployment where two people talk to the same agent: it is the only
-thing stopping one person's chat being quoted into another person's prompt.
+Set `cross_session.same_user_only: false` if your store is single-operator and you want
+unrestricted recall. Leave it at `true` on any deployment where two people talk to the same
+agent: it is the only thing stopping one person's chat being quoted into another person's
+prompt.
 
 ---
 
@@ -141,7 +144,7 @@ hermes plugins enable verbatim-recall
 ```
 
 `register(ctx)` wires `pre_llm_call` → `recall` and `post_compaction` → cache drop. The
-default source is `$VERBATIM_DB` or `<hermes home>/state.db`, reading
+default source is the `db_path` setting (unset → `<hermes home>/state.db`), reading
 `messages(id, role, content, session_id)` where `compacted=1`.
 
 ### Any other framework
@@ -199,7 +202,7 @@ If your framework **discards** verbatim turns at compaction instead of marking t
 there is nothing to reclaim: fix retention first (keep rows, set a `compacted` flag, or
 append to a JSONL archive). This tool is deliberately not a transcript writer.
 
-Cross-session recall (`VERBATIM_CROSS=1`, the default) needs two more things, and simply
+Cross-session recall (`cross_session.enabled: true`, the default) needs two more things, and simply
 switches itself off when they are absent:
 
 1. an **FTS5 index** over the message bodies with `rowid` = message id (Hermes' `state.db`
@@ -216,40 +219,61 @@ If you bring your own source callable, cross-session recall is off unless you al
 
 ## Tuning
 
-Everything is an environment variable; the defaults were tuned on a real 1,164-turn
-compacted region and are meant to be a starting point, not a law.
+Every knob is a **YAML item** in this repo's `plugin.yaml` (`config_schema:`), and its value
+is written to `config.yaml` under `plugins.entries.verbatim-recall.settings`. A dotted key
+becomes a nested mapping, and nothing reads the environment — so the settings file is the
+single source of truth:
 
-| Var | Default | Meaning |
+```yaml
+plugins:
+  entries:
+    verbatim-recall:
+      settings:
+        min_score: 1.8
+        cross_session:
+          cooldown: 12
+          sources: [telegram, a2a]
+```
+
+Check the effective values with `hermes plugins settings verbatim-recall` (or the settings
+UI, which renders the same schema with labels and descriptions). Every key below is optional:
+omit it and the built-in default applies, so an empty settings block behaves exactly like
+the tuned defaults. Imported outside Hermes (tests, CLI), `configure({...})` accepts the same
+flat keys.
+
+| Setting | Default | Meaning |
 |---|---|---|
-| `VERBATIM_DB` | `<hermes home>/state.db` | Hermes state DB path |
-| `VERBATIM_TOP_K` | `2` | strict pointers per turn (capped 4) |
-| `VERBATIM_MIN_SCORE` | `1.6` | absolute floor for a strict hit |
-| `VERBATIM_COVERAGE` | `0.45` | share of the query's IDF mass the turn must carry |
-| `VERBATIM_MIN_TERMS` | `2` | agreeing terms needed (single term must be near-unique) |
-| `VERBATIM_LOOSE_SCORE` | `0.9` | floor for the low-confidence tier |
-| `VERBATIM_LOOSE_COVERAGE` | `0.20` | coverage floor for the low-confidence tier |
-| `VERBATIM_LOOSE_TOP_K` | `1` | max low-confidence pointers per turn (capped 2) |
-| `VERBATIM_COMMON_WEIGHT` | `0.3` | weight of non-rare terms in the loose tier |
-| `VERBATIM_RARE_DF` | `max(8, 5% of turns)` | df at or below which a term counts as rare |
-| `VERBATIM_BOILER_DF` | `max(12, 10% of turns)` | terms above this df are dropped as boilerplate |
-| `VERBATIM_SPAN` | `24` | min id distance between two pointers (no near-duplicates) |
-| `VERBATIM_PREVIEW` | `90` | chars of the opening ask quoted in a pointer |
-| `VERBATIM_WINDOW` | `20` | suggested scroll radius handed to the reader |
-| `VERBATIM_ANNOUNCE` | `1` | emit the ids-range line once per region growth |
-| `VERBATIM_QUIET` | `0` | `1` = index only, never inject |
-| `VERBATIM_CROSS` | `1` | `1` = also point at other sessions on the same agent |
-| `VERBATIM_CROSS_SOURCES` | `telegram,api_server,cli,desktop,mobile,a2a` | session sources eligible for cross-session recall |
-| `VERBATIM_CROSS_SAME_USER` | `1` | only recall sessions belonging to the same principal |
-| `VERBATIM_CROSS_TRUSTED` | `a2a` | sources exempt from the identity check (peers have their own ids) |
-| `VERBATIM_CROSS_TOP_K` | `2` | foreign pointers per turn |
-| `VERBATIM_CROSS_MIN_TERMS` | `3` | agreeing words required — one more than the local tier |
-| `VERBATIM_CROSS_SHARE` | `0.55` | matched IDF mass as a share of the pool's best turn |
-| `VERBATIM_CROSS_POOL` | `400` | candidate turns pulled from the FTS index before re-scoring |
-| `VERBATIM_CROSS_COOLDOWN` | `6` | turns before the same foreign session may be pointed at again |
+| `db_path` | `<hermes home>/state.db` | Hermes state DB path |
+| `top_k` | `2` | strict pointers per turn (capped 4) |
+| `min_score` | `1.6` | absolute floor for a strict hit |
+| `coverage` | `0.45` | share of the query's IDF mass the turn must carry |
+| `min_terms` | `2` | agreeing terms needed (single term must be near-unique) |
+| `loose_score` | `0.9` | floor for the low-confidence tier |
+| `loose_coverage` | `0.20` | coverage floor for the low-confidence tier |
+| `loose_top_k` | `1` | max low-confidence pointers per turn (capped 2) |
+| `common_weight` | `0.3` | weight of non-rare terms in the loose tier |
+| `rare_df` | `0` = `max(8, 5% of turns)` | df at or below which a term counts as rare |
+| `boiler_df` | `0` = `max(12, 10% of turns)` | terms above this df are dropped as boilerplate |
+| `span` | `24` | min id distance between two pointers (no near-duplicates) |
+| `preview` | `90` | chars of the opening ask quoted in a pointer |
+| `window` | `20` | suggested scroll radius handed to the reader |
+| `announce` | `true` | emit the ids-range line once per region growth |
+| `quiet` | `false` | `true` = index only, never inject |
+| `cross_session.enabled` | `true` | also point at other sessions on the same agent |
+| `cross_session.sources` | `[telegram, api_server, cli, desktop, mobile, a2a]` | session sources eligible for cross-session recall |
+| `cross_session.same_user_only` | `true` | only recall sessions belonging to the same principal |
+| `cross_session.trusted_principals` | `[api]` | extra principals treated as this operator (the local API surface) |
+| `cross_session.trusted_sources` | `[a2a]` | sources exempt from the identity check (peers have their own ids) |
+| `cross_session.top_k` | `2` | foreign pointers per turn |
+| `cross_session.min_terms` | `3` | agreeing words required — one more than the local tier |
+| `cross_session.share` | `0.55` | matched IDF mass as a share of the pool's best turn |
+| `cross_session.pool` | `400` | candidate turns pulled from the FTS index before re-scoring |
+| `cross_session.max_terms` | `12` | query words used for the foreign fingerprint match |
+| `cross_session.cooldown` | `6` | turns before the same foreign session may be pointed at again |
 
-**Too many weak pointers?** Raise `VERBATIM_COVERAGE` to 0.55, then `VERBATIM_MIN_SCORE`.
-Widen `VERBATIM_BOILER_DF` if your region is small. **Missing things?** Lower
-`VERBATIM_LOOSE_SCORE`/`VERBATIM_LOOSE_COVERAGE` first — they only affect the labelled
+**Too many weak pointers?** Raise `coverage` to 0.55, then `min_score`.
+Widen `boiler_df` if your region is small. **Missing things?** Lower
+`loose_score`/`loose_coverage` first — they only affect the labelled
 tier, so the trustworthy pointers stay untouched.
 
 ---
@@ -294,7 +318,7 @@ not deploying it — plugin modules are imported once at start.
   the id no longer resolves. The label names the owner so a failed read is diagnosable.
 * identity scoping compares `user_id` strings; a store that stamps a shared placeholder
   (`api` for every API client, for instance) cannot separate two humans by itself — set
-  `VERBATIM_CROSS_SAME_USER=0` deliberately, or fix the stamps upstream.
+  `cross_session.same_user_only: false` deliberately, or fix the stamps upstream.
 * the archive's coherence is the framework's job; if rows are missing, pointers are missing.
 * no reranking of the matched span's content: the top-1 id is chosen by the gate, not by a
   second model pass.
