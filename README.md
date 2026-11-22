@@ -131,8 +131,10 @@ Single file, stdlib only, Python 3.9+. Pick the row that matches your host.
 
 ```bash
 mkdir -p "$HERMES_HOME/plugins/verbatim-recall"      # Windows: %LOCALAPPDATA%\hermes\plugins\...
-curl -fsSL https://raw.githubusercontent.com/raymondclowe/verbatim-recall/main/verbatim_recall.py \
-  -o "$HERMES_HOME/plugins/verbatim-recall/__init__.py"
+cd "$HERMES_HOME/plugins/verbatim-recall"
+BASE=https://raw.githubusercontent.com/raymondclowe/verbatim-recall/main
+curl -fsSL "$BASE/verbatim_recall.py" -o __init__.py   # loader imports __init__.py, not the repo name
+curl -fsSL "$BASE/plugin.yaml"        -o plugin.yaml    # manifest: name/version/description
 hermes plugins enable verbatim-recall
 # the module is imported at gateway start — restart the gateway, or `hermes plugins enable`
 # has already told you it is a no-op on an already-enabled plugin
