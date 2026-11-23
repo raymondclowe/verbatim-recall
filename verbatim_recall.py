@@ -99,6 +99,12 @@ DEFAULTS: dict = {
     # Principals that are the operator's own non-chat surfaces: ``api`` is what the local
     # api_server records, so turns typed into the API are quotable from Telegram.
     "cross_session.trusted_principals": ["api"],
+    # An asking session whose principal was never recorded (NULL/empty user_id) used to be
+    # treated as "the operator", which quoted alice and bob to an anonymous asker. Now an
+    # unrecorded asker matches only rows that are also unrecorded, unless its source is
+    # listed in ``unattributed_sources`` -- the surfaces that run on this host under this
+    # operator and genuinely record no principal.
+    "cross_session.unattributed_sources": ["cli", "api_server"],
     # a2a rows are the same operator's other machines, each with its own user_id (ip:…)
     "cross_session.trusted_sources": ["a2a"],
 
@@ -182,6 +188,7 @@ CROSS_SOURCES = ("telegram", "api_server", "cli", "desktop", "mobile", "a2a")
 CROSS_SAME_USER = True
 CROSS_TRUSTED = ("a2a",)
 CROSS_TRUSTED_PRINCIPALS = ("api",)
+CROSS_UNATTRIBUTED = ("cli", "api_server")   # may ask with no recorded principal
 METRICS = True
 METRICS_DIR = ""
 METRICS_RETENTION = 30
@@ -196,7 +203,7 @@ def _apply() -> None:
     global CROSS, CROSS_TOP_K, CROSS_MIN_TERMS, CROSS_SHARE, CROSS_POOL
     global CROSS_MAX_TERMS, CROSS_COOLDOWN, CROSS_SOURCES, CROSS_SAME_USER, CROSS_TRUSTED
     global DF_PROBE_TERMS, DF_CAP
-    global CROSS_TRUSTED_PRINCIPALS
+    global CROSS_TRUSTED_PRINCIPALS, CROSS_UNATTRIBUTED
     global METRICS, METRICS_DIR, METRICS_RETENTION, METRICS_TERMS, METRICS_SHADOW
     global METRICS_TAG
     cfg = CONFIG
@@ -231,6 +238,9 @@ def _apply() -> None:
     CROSS_TRUSTED_PRINCIPALS = tuple(
         _as_list(cfg.get("cross_session.trusted_principals"),
                  DEFAULTS["cross_session.trusted_principals"]))
+    CROSS_UNATTRIBUTED = tuple(
+        _as_list(cfg.get("cross_session.unattributed_sources"),
+                 DEFAULTS["cross_session.unattributed_sources"]))
     METRICS = _as_bool(cfg.get("metrics.enabled"), DEFAULTS["metrics.enabled"])
     METRICS_DIR = str(cfg.get("metrics.path") or "").strip()
     METRICS_RETENTION = _as_int(cfg.get("metrics.retention_days"),
@@ -306,8 +316,6 @@ _cache: dict = {}          # session_id -> (signature, index)
 _announced: dict = {}      # session_id -> highest id already announced
 _cross_turn: dict = {}     # session_id -> turn counter, for the foreign-pointer cooldown
 _cross_seen: dict = {}     # (session_id, foreign_session_id) -> turn last pointed at
-_cross_last_query: str = ""  # last MATCH actually used, for the CLI's "match:" line
-_cross_last_rung: str = ""   # which rung of the ladder produced it
 _fts_ok: dict = {}         # db path -> bool (does this store have messages_fts?)
 
 
@@ -448,6 +456,7 @@ def build_index(rows):
     last_ask = ""
     first = last = 0
     raw = 0
+    tools = 0
     for r in rows:
         raw += 1
         body = _field(r, "content") or ""
@@ -460,10 +469,19 @@ def build_index(rows):
         last = mid
         if _derived(body):
             continue
+        role = _field(r, "role")
+        if role == "tool":
+            # A tool row is the agent's own output: grep dumps and file reads that echo
+            # the words being searched for. On a live region they are 929 of 1,889 rows,
+            # so a query matched them more readily than the answer -- the winner for one
+            # real query was a grep dump. They cannot be *pointed at* as an answer, so
+            # they are not indexed. Counted, so the drop is visible in `index`.
+            tools += 1
+            continue
         n += 1
-        if _field(r, "role") == "user" and body.strip():
+        if role == "user" and body.strip():
             last_ask = _clean(body)
-        preview[mid] = (_field(r, "role"), last_ask)
+        preview[mid] = (role, last_ask)
         for t in set(tokens(body)):
             inv.setdefault(t, set()).add(mid)
 
@@ -486,12 +504,35 @@ def build_index(rows):
         "lo": first,
         "hi": last,
         "raw": raw,
+        "tools": tools,
         "boiler_df": boiler_df,
         "rare_df": rare_df,
     }
 
 
 def _signature(source, session_id: str):
+    """(row count, highest id) -- the cheap shape check, read from the STORE.
+
+    It used to iterate ``source(session_id)`` and pull every row's full content just
+    to count rows: 19.1 ms per turn on a 2,041-row region, spent to decide whether to
+    rebuild an index that was usually unchanged. The source built from a database has
+    a ``.path``, and two index-covered aggregates answer the same question in ~0.1 ms.
+    A caller's own iterable (no path) still falls back to counting it.
+    """
+    path = getattr(source, "path", None)
+    if path:
+        try:
+            con = _connect_ro(path)
+            try:
+                row = con.execute(
+                    "select count(*) as n, coalesce(max(id), 0) as hi from messages "
+                    "where session_id = ? and compacted = 1", (session_id,)).fetchone()
+            finally:
+                con.close()
+            if row is not None:
+                return (int(row["n"]), int(row["hi"]))
+        except Exception:
+            pass
     try:
         n = 0
         hi = 0
@@ -537,7 +578,8 @@ def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None,
     top_k = TOP_K if top_k is None else top_k
     loose_top_k = LOOSE_TOP_K if loose_top_k is None else loose_top_k
     if diag is not None:
-        diag.clear()
+        # merge, do not clear: `recall` fills this same dict for the report, and a
+        # clear here would wipe what the cross pass and the shape check already wrote.
         diag.update({"strict_cands": 0, "strict_below": 0, "strict_gated_terms": 0,
                      "strict_gated_span": 0, "loose_cands": 0, "loose_below": 0,
                      "loose_gated": 0})
@@ -822,6 +864,16 @@ def _cross_pool(con, user_message: str, exclude_session_id: str, pool: int = Non
     return rows, query, 'no-score', []
 
 
+def _asker_source(con, session_id: str) -> str:
+    """The ``source`` of the session asking the question ("" when it is not recorded)."""
+    try:
+        row = con.execute("select coalesce(source,'') as s from sessions where id = ?",
+                          (session_id,)).fetchone()
+        return (row["s"] if row else "") or ""
+    except Exception:
+        return ""
+
+
 def _cross_candidates(con, query: str, exclude_session_id: str, pool: int = None,
                       user_id: str = None, recent: bool = False):
     """One scoped bm25 pass over every other session on this agent."""
@@ -840,20 +892,37 @@ def _cross_candidates(con, query: str, exclude_session_id: str, pool: int = None
     if CROSS_SOURCES and CROSS_SOURCES != ("all",):
         sql += " and coalesce(s.source,'') in (%s)" % ",".join("?" * len(CROSS_SOURCES))
         args.extend(CROSS_SOURCES)
-    if CROSS_SAME_USER and user_id:
-        # same principal, or a row whose principal was never recorded (local CLI/API
-        # use on this host), or a principal/source the operator declared his own
-        # (`api` = the local api_server surface, `a2a` = another machine of his).
-        ors = ["coalesce(s.user_id,'') = ?", "coalesce(s.user_id,'') = ''"]
-        args.append(user_id)
-        if CROSS_TRUSTED_PRINCIPALS:
-            ors.append("coalesce(s.user_id,'') in (%s)"
-                       % ",".join("?" * len(CROSS_TRUSTED_PRINCIPALS)))
-            args.extend(CROSS_TRUSTED_PRINCIPALS)
-        if CROSS_TRUSTED:
-            ors.append("coalesce(s.source,'') in (%s)"
-                       % ",".join("?" * len(CROSS_TRUSTED)))
-            args.extend(CROSS_TRUSTED)
+    if CROSS_SAME_USER:
+        # A recorded principal sees its own rows, rows with no principal (local CLI/API on
+        # this host), and the principals/sources the operator declared his own.
+        #
+        # An UNRECORDED asker (user_id NULL — the CLI, the api_server, a replayed turn)
+        # used to take the same branch, which matched every row with no principal AND
+        # every trusted principal: alice's and bob's chats were quoted to an anonymous
+        # asker. It now sees only rows that are also unrecorded, unless its own source is
+        # one of ``unattributed_sources`` (surfaces that run as this operator and record
+        # nothing) -- a Telegram session with no user_id is the case that was leaking.
+        ors = []
+        if user_id:
+            ors.append("coalesce(s.user_id,'') = ?")
+            args.append(user_id)
+            ors.append("coalesce(s.user_id,'') = ''")
+            if CROSS_TRUSTED_PRINCIPALS:
+                ors.append("coalesce(s.user_id,'') in (%s)"
+                           % ",".join("?" * len(CROSS_TRUSTED_PRINCIPALS)))
+                args.extend(CROSS_TRUSTED_PRINCIPALS)
+            if CROSS_TRUSTED:
+                ors.append("coalesce(s.source,'') in (%s)"
+                           % ",".join("?" * len(CROSS_TRUSTED)))
+                args.extend(CROSS_TRUSTED)
+        else:
+            ors.append("coalesce(s.user_id,'') = ''")
+            asker_source = _asker_source(con, exclude_session_id)
+            if asker_source and asker_source in CROSS_UNATTRIBUTED:
+                if CROSS_TRUSTED:
+                    ors.append("coalesce(s.source,'') in (%s)"
+                               % ",".join("?" * len(CROSS_TRUSTED)))
+                    args.extend(CROSS_TRUSTED)
         sql += " and (" + " or ".join(ors) + ")"
     # bm25 ordering must sort every row the MATCH set contains: fine for a tightened
     # AND (hundreds), ruinous for the OR fallback (tens of thousands, measured 800+ ms
@@ -917,8 +986,14 @@ def _session_range(con, owner: str):
     return 0, 0
 
 
-def cross_hits(session_id: str, user_message: str, db_path: str = None, top_k: int = None):
-    """Spans in *other* sessions that overlap this query, one pointer per session."""
+def cross_hits(session_id: str, user_message: str, db_path: str = None, top_k: int = None,
+               diag: dict = None):
+    """Spans in *other* sessions that overlap this query, one pointer per session.
+
+    ``diag`` (optional dict) receives what the pass saw -- the MATCH it used, which
+    rung produced it, and how many candidates the gates refused. It is passed, not held
+    in a module global: the gateway runs turns on threads, and a global raced.
+    """
     if not CROSS or not session_id:
         return []
     db_path = db_path or getattr(hermes_source(), "path", None)
@@ -935,8 +1010,9 @@ def cross_hits(session_id: str, user_message: str, db_path: str = None, top_k: i
             uid = ""
         cands, query, rung, ranked = _cross_pool(
             con, user_message, session_id, user_id=uid)
-        globals()["_cross_last_query"] = query
-        globals()["_cross_last_rung"] = rung
+        if diag is not None:
+            diag.update({"match": query, "rung": rung, "pool": len(cands or []),
+                         "scored": len(ranked or [])})
         if not ranked:
             return []
         best: dict = {}
@@ -1465,6 +1541,7 @@ def recall(
             return None
         if not idx and not cross:
             metric("miss", session=session_id, why="no_index", turn=turn,
+                   diag=diag if METRICS_SHADOW else None,
                    ms=round((time.perf_counter() - t0) * 1000, 1))
             return None
 
@@ -1478,6 +1555,12 @@ def recall(
 
         lines = []
         ptrs = []
+        # per-turn diagnosis, filled by the stages below and written on every outcome.
+        # An empty list is the whole reason this exists: the report used to say
+        # "no pointer" every turn with no way to tell a near miss from a non-starter.
+        diag.update({"terms": len(set(tokens(user_message))),
+                     "turns": idx["n"] if idx else 0,
+                     "informative": 0, "pool": 0, "gated": 0, "rungs": []})
         if idx and announce and _announced.get(session_id, 0) < idx["hi"]:
             _announced[session_id] = idx["hi"]
             lines.append(
@@ -1489,7 +1572,9 @@ def recall(
                          "tier": "announce", "terms": []})
 
         qwords = len(set(tokens(user_message)))
-        hits = match(idx, user_message, diag=diag if METRICS_SHADOW else None) if idx else []
+        # `diag` now exists on every path (it is created above), so the gates fill it in
+        # whether or not shadow logging is on -- the report reads it either way.
+        hits = match(idx, user_message, diag=diag) if idx else []
         for mid, _sc, terms, tier, _cov in hits:
             role, ask = idx["preview"].get(mid, ("", ""))
             # the handle is the matched turn itself; window=20 supplies the context
@@ -1511,6 +1596,9 @@ def recall(
             lines.append(body)
             ptrs.append({"o": session_id, "lo": start,
                          "hi": min(idx["hi"], mid + 3), "tier": tier,
+                         # metrics.store_terms=false keeps the words out of the LOG only.
+                         # They stay in `terms` because the context line above prints them
+                         # anyway; blanking them is done once, when the event is written.
                          "terms": sorted(terms)[:5]})
 
         if cross:
@@ -1521,7 +1609,7 @@ def recall(
                 # single-session unless it opts in with cross_db (documented).
                 db_for_cross = getattr(hermes_source(), "path", None)
             clines, cptrs = _cross_lines(session_id, user_message, reader, qwords,
-                                         db_for_cross)
+                                         db_for_cross, diag=diag)
             lines.extend(clines)
             ptrs.extend(cptrs)
 
@@ -1545,7 +1633,11 @@ def recall(
                    diag=diag if METRICS_SHADOW else None,
                    terms=[t for p in ptrs for t in p["terms"]][:8]
                    if METRICS_TERMS else None,
-                   ptrs=ptrs, ms=round((time.perf_counter() - t0) * 1000, 1))
+                   # store_terms=false must hold for the pointers too: they are the same
+                   # words, and they were being written regardless of the setting.
+                   ptrs=([{**p, "terms": []} for p in ptrs] if not METRICS_TERMS
+                         else ptrs),
+                   ms=round((time.perf_counter() - t0) * 1000, 1))
             _add_pending(session_id, fire, turn,
                          [[p["o"], p["lo"], p["hi"]] for p in ptrs])
         return {"context": text}
@@ -1556,12 +1648,14 @@ def recall(
 
 
 def _cross_lines(session_id: str, user_message: str, reader, qwords: int,
-                 db_path: str | None):
+                 db_path: str | None, diag: dict = None):
     """Foreign pointers, cooled down so one old session cannot nag on every turn."""
     try:
         if not db_path:
+            if diag is not None:
+                diag["cross"] = "no-store"
             return [], []
-        hits = cross_hits(session_id, user_message, db_path=db_path)
+        hits = cross_hits(session_id, user_message, db_path=db_path, diag=diag)
         if not hits:
             return [], []
         words = list(dict.fromkeys(tokens(user_message)))
@@ -1584,7 +1678,8 @@ def _cross_lines(session_id: str, user_message: str, reader, qwords: int,
             _cross_seen[key] = turn
             out.append(_cross_line(hit, reader, words, kmap))
             ptrs.append({"o": hit["session_id"], "lo": hit["lo"], "hi": hit["hi"],
-                         "tier": "loose", "terms": list(hit["terms"])[:5]})
+                         "tier": "loose",
+                         "terms": list(hit["terms"])[:5]})
         return out, ptrs
     except Exception:
         return [], []
@@ -1657,9 +1752,11 @@ def _main(argv) -> int:
             print("query too short for cross-session (needs at least %d terms)" % CROSS_MIN_TERMS)
             return 0
         t0 = time.time()
-        hits = cross_hits(sid, rest, db_path=getattr(src, "path", None))
+        d: dict = {}
+        hits = cross_hits(sid, rest, db_path=getattr(src, "path", None), diag=d)
         dt = (time.time() - t0) * 1000.0
-        print(f"match: {_cross_last_query or q}  [{_cross_last_rung or '?'}]")
+        print(f"match: {d.get('match') or q}  [{d.get('rung') or '?'}]"
+              f"  pool {d.get('pool', 0)} rows, {d.get('scored', 0)} scored")
         print(f"{len(hits)} foreign span(s) in {dt:.1f} ms "
               f"(pool {CROSS_POOL}, top_k {CROSS_TOP_K}, "
               f"min_terms {CROSS_MIN_TERMS}, share {CROSS_SHARE:.2f})")
@@ -1674,7 +1771,8 @@ def _main(argv) -> int:
         if not idx:
             print("no compacted region")
             return 1
-        print(f"{idx['raw']} compacted msgs, {idx['n']} indexed, ids {idx['lo']}-{idx['hi']}\n"
+        print(f"{idx['raw']} compacted msgs, {idx['n']} indexed "
+              f"({idx.get('tools', 0)} tool rows skipped), ids {idx['lo']}-{idx['hi']}\n"
               f"{len(idx['inv'])} kept terms ({len(idx['rare'])} rare<={idx['rare_df']}), "
               f"boilerplate cut at df>{idx['boiler_df']}")
         return 0

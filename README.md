@@ -54,6 +54,7 @@ vocabulary. These rules do the work:
 | Rule | Reason |
 |---|---|
 | **Derived text is not indexed** | summaries and process notices quote anything, so they match anything |
+| **Tool output is not indexed** | a tool row is the agent's own grep dump or file read — it echoes the words you searched for, so it matches first and answers nothing. 929 of 1,889 rows in the live region were tool rows; one real query's winner was a raw grep dump until they were dropped |
 | **Boilerplate is not evidence** | a term carried by >10% of the region (`output`, `error`, `exit_code`) is dropped |
 | **Only rare terms score in the strict tier** | one common word fakes a hit |
 | **A lone term must look like a handle** | "rare in this region" is not the same as "identifies a turn": `control` appears twice on a 1,635-turn archive and means nothing; `capitulation` is 12 letters and appears in 47 turns. Digits, an internal `_.-/`, or a hash-length token, **and** carried by at most two turns |
@@ -134,6 +135,14 @@ Set `cross_session.same_user_only: false` if your store is single-operator and y
 unrestricted recall. Leave it at `true` on any deployment where two people talk to the same
 agent: it is the only thing stopping one person's chat being quoted into another person's
 prompt.
+
+**An asking session with no recorded principal** (`user_id` NULL — the CLI, the api_server,
+a replayed turn) used to take the "same principal" branch anyway, which matched every
+unrecorded row *and* every trusted principal: a Telegram session with no `user_id` was
+quoted alice's and bob's chats. It now sees only rows that are also unrecorded, unless its
+own `source` is listed in `cross_session.unattributed_sources` (default `cli`, `api_server` —
+surfaces that run as this operator and record nothing). A Telegram session with no principal
+therefore sees no foreign rows at all; fix the stamp upstream if that is the case you have.
 
 ---
 
@@ -275,6 +284,7 @@ flat keys.
 | `cross_session.same_user_only` | `true` | only recall sessions belonging to the same principal |
 | `cross_session.trusted_principals` | `[api]` | extra principals treated as this operator (the local API surface) |
 | `cross_session.trusted_sources` | `[a2a]` | sources exempt from the identity check (peers have their own ids) |
+| `cross_session.unattributed_sources` | `[cli, api_server]` | sources allowed to ask with no recorded `user_id` and still see unrecorded rows |
 | `cross_session.top_k` | `2` | foreign pointers per turn |
 | `cross_session.min_terms` | `3` | agreeing words required — one more than the local tier |
 | `cross_session.share` | `0.55` | matched IDF mass as a share of the pool's best turn |

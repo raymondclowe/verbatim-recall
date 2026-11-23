@@ -193,7 +193,7 @@ class CrossCost(unittest.TestCase):
         con = vr._connect_ro(self.db)
         try:
             rows, q, rung, scored = vr._cross_pool(
-                con, "probook ubuntu firmware rebuilt", "aux")
+                con, "probook ubuntu firmware rebuilt", "aux", user_id="me")
         finally:
             con.close()
         self.assertTrue(rows, "nothing found at all")
@@ -233,7 +233,7 @@ class CrossCost(unittest.TestCase):
         con = vr._connect_ro(self.db)
         try:
             rows, q, rung, scored = vr._cross_pool(
-                con, "kettle ledger throttle zircon quartzley", "aux")
+                con, "kettle ledger throttle zircon quartzley", "aux", user_id="me")
         finally:
             con.close()
         ids = [r["id"] for r in scored]
@@ -244,7 +244,7 @@ class CrossCost(unittest.TestCase):
         con = vr._connect_ro(self.db)
         try:
             # one term is absent from the store: the ladder must loosen, not give up
-            rows, q, rung, scored = vr._cross_pool(con, "probook lemonspade firmware", "aux")
+            rows, q, rung, scored = vr._cross_pool(con, "probook lemonspade firmware", "aux", user_id="me")
         finally:
             con.close()
         self.assertTrue(rows, "gave up instead of loosening the MATCH")
@@ -278,7 +278,7 @@ class CrossCost(unittest.TestCase):
         con = vr._connect_ro(self.db)
         try:
             got, q, rung, scored = vr._cross_pool(
-                con, "ubuntu server output probook rebuild", "aux")
+                con, "ubuntu server output probook rebuild", "aux", user_id="me")
         finally:
             con.close()
         self.assertIn(10, [r["id"] for r in scored],
@@ -296,7 +296,7 @@ class CrossCost(unittest.TestCase):
         vr.configure(self._cfg_with(**{"cross_session.df_cap": 20}))
         con = vr._connect_ro(self.db)
         try:
-            got, q, rung, scored = vr._cross_pool(con, common + " zircon", "aux")
+            got, q, rung, scored = vr._cross_pool(con, common + " zircon", "aux", user_id="me")
         finally:
             con.close()
         self.assertIn(10, [r["id"] for r in scored],
@@ -341,6 +341,86 @@ class HookCross(unittest.TestCase):
                           user_message="probook rebuilt ubuntu firmware", cross=True)
         self.assertIsNotNone(block, "no pointer at all")
         self.assertIn("ANOTHER SESSION", block["context"])
+
+
+class ReportAndGlobals(unittest.TestCase):
+    """The four leftovers: index shape check, racy globals, diag on the log, terms leak."""
+
+    def setUp(self):
+        self._cfg = dict(vr.CONFIG)
+        self.addCleanup(vr.configure, self._cfg)
+        self.dir = tempfile.mkdtemp(prefix="vr-leftovers-")
+        self.db = os.path.join(self.dir, "state.db")
+        con = sqlite3.connect(self.db)
+        con.executescript(
+            "create table messages (id integer primary key, session_id text, role text,"
+            " content text, timestamp real, compacted integer default 0);"
+            "create table sessions (id text primary key, source text, user_id text,"
+            " title text, display_name text, started_at real, last_activity_at real);"
+            "create virtual table messages_fts using fts5(content);")
+        con.execute("insert into sessions values ('aux','telegram','me','a','a',1.0,1.0)")
+        con.execute("insert into messages (id,session_id,role,content,compacted) values "
+                    "(7,'aux','user','probook rebuilt as ubuntu server',1)")
+        con.execute("insert into messages (id,session_id,role,content,compacted) values "
+                    "(8,'aux','assistant','the firmware fix was the network stack',1)")
+        con.commit()
+        con.close()
+
+    def _configure(self, **kv):
+        cfg = dict(vr.CONFIG)
+        cfg["db_path"] = self.db
+        cfg["metrics.enabled"] = False
+        cfg.update(kv)
+        vr.configure(cfg)
+
+    def test_the_shape_check_counts_without_reading_bodies(self):
+        # reading every row's content cost 14.6-19.1 ms per turn to decide "unchanged".
+        class BodyReader:
+            """A source that explodes if anyone iterates it -- proves the store path wins."""
+            path = self.db
+
+            def __call__(self, sid):
+                raise AssertionError("iterated the source instead of the store")
+
+        self.assertEqual(vr._signature(BodyReader(), "aux"), (2, 8))
+
+    def test_shape_check_still_works_for_a_plain_callable(self):
+        self.assertEqual(vr._signature(
+            lambda sid: [{"id": 1}, {"id": 5}, {"id": 3}], "any"), (3, 5))
+
+    def test_the_cross_pass_reports_its_rung_without_a_module_global(self):
+        d: dict = {}
+        vr.cross_hits("aux", "probook rebuilt ubuntu", db_path=self.db, diag=d)
+        self.assertIn("rung", d)
+        self.assertIn("match", d)
+        self.assertFalse(hasattr(vr, "_cross_last_rung"),
+                         "the racy module global is back")
+
+    def test_store_terms_off_keeps_the_words_out_of_the_log(self):
+        self._configure()
+        vr.configure({"db_path": self.db, "metrics.enabled": True,
+                      "metrics.path": os.path.join(self.dir, "logs"),
+                      "metrics.store_terms": False})
+        con = sqlite3.connect(self.db)
+        con.execute("insert into messages (id,session_id,role,content) values "
+                    "(31,'aux','assistant','zzrare probook rebuilt ubuntu server firmware')")
+        con.commit()
+        con.close()
+        con = sqlite3.connect(self.db)
+        con.execute("insert into messages_fts (rowid, content) select id, content "
+                    "from messages where id = 31")
+        con.commit()
+        con.close()
+        vr._cache.clear()
+        vr.recall(session_id="aux", user_message="probook rebuilt ubuntu firmware",
+                  cross=False)
+        lines = vr.load_metrics(30)
+        fires = [e for e in lines if e.get("ev") == "fire"]
+        self.assertTrue(fires, "nothing was logged, so this proves nothing")
+        for e in fires:
+            for p in e.get("ptrs") or []:
+                self.assertEqual(p.get("terms"), [],
+                                 "metrics.store_terms=false still logged the words")
 
 
 class MetricsIsolated(unittest.TestCase):
