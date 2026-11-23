@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verbatim-recall — is it helping?</title>
+<style>
+  :root{
+    --ink:#12161c; --muted:#5b6675; --line:#dfe4ea; --bg:#f6f7f9; --card:#fff;
+    --ok:#0f7b46; --okbg:#e6f4ec; --model:#8a5a00; --modelbg:#fdf3e0;
+    --none:#6b7280; --nonebg:#eef0f3; --accent:#1f4e79;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px 20px 56px;background:var(--bg);color:var(--ink);
+       font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:940px;margin:0 auto}
+  header{margin-bottom:22px}
+  h1{font-size:23px;margin:0 0 6px;letter-spacing:-.2px}
+  .sub{color:var(--muted);font-size:13px}
+  .verdict{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--ok);
+           border-radius:8px;padding:16px 18px;margin:18px 0 24px}
+  .verdict strong{font-size:16px}
+  .verdict p{margin:8px 0 0;color:var(--muted);font-size:13.5px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px;margin:0 0 26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 15px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+           margin:0 0 8px;font-weight:600}
+  .big{font-size:26px;font-weight:650;line-height:1.1;margin:0 0 6px}
+  .big small{font-size:13px;font-weight:500;color:var(--muted)}
+  .card p{margin:6px 0 0;font-size:13px;color:var(--muted)}
+  .badge{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.06em;
+         padding:2px 7px;border-radius:99px;margin-top:10px;text-transform:uppercase}
+  .b-ok{color:var(--ok);background:var(--okbg)}
+  .b-model{color:var(--model);background:var(--modelbg)}
+  .b-none{color:var(--none);background:var(--nonebg)}
+  section{background:var(--card);border:1px solid var(--line);border-radius:8px;
+          padding:18px 20px;margin:0 0 16px}
+  section h3{margin:0 0 10px;font-size:16px}
+  section h3 span{font-weight:400;color:var(--muted);font-size:13px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin:6px 0 0}
+  th,td{text-align:left;padding:7px 10px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .bar{height:12px;border-radius:6px;background:#eceff3;overflow:hidden;display:flex;margin:10px 0 6px}
+  .bar i{display:block;height:100%}
+  .bar .strict{background:#0f7b46}
+  .bar .loose{background:#c9a227}
+  .bar .announce{background:#8a94a6}
+  .legend{font-size:12px;color:var(--muted)}
+  .legend b{color:var(--ink)}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+  pre{background:#0f1319;color:#e7edf5;padding:12px 14px;border-radius:7px;overflow-x:auto}
+  .note{border-left:3px solid var(--model);background:var(--modelbg);padding:10px 14px;
+        border-radius:6px;font-size:13px;color:#4a3400;margin:12px 0 0}
+  .limits{list-style:none;padding:0;margin:10px 0 0;font-size:13.5px}
+  .limits li{padding:6px 0 6px 22px;position:relative;border-bottom:1px solid var(--line)}
+  .limits li:last-child{border-bottom:0}
+  .limits li::before{content:"→";position:absolute;left:0;color:var(--accent)}
+  footer{color:var(--muted);font-size:12px;margin-top:20px;text-align:center}
+  @media print{body{background:#fff;padding:0}.card,section,.verdict{break-inside:avoid;border-color:#ccc}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Is verbatim-recall helping?</h1>
+  <div class="sub">{{window_first}} → {{window_last}} · {{turns}} turns ({{live}} live, {{replay}} replay) · {{fires}} fires · {{ptrs}} pointers</div>
+</header>
+
+<div class="verdict">
+  <strong>The forgetting is reversible, and the price of that is {{tok_turn}} tokens per turn.</strong>
+  <p>Recall fires on {{fire_pct}}% of turns and puts a stable, re-readable pointer in the prompt
+  instead of a summary of a summary. It pays for itself if it prevents at least
+  <b>{{avoid_pct}}%</b> of the repeat investigations it fires on — a demanding bar, worth watching (measured baseline
+  {{baseline_pct}}%, break-even {{breakeven_pct}}%). Read each card below with its badge:
+  <b>measured</b> is straight out of the event log, <b>model</b> needs a printed assumption,
+  <b>not measured</b> is stated rather than reported as zero.</p>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Accuracy</h2>
+    <p class="big">{{strict_pct}}<small>% exact-span hits</small></p>
+    <p>{{strict}} strict of {{ptrs}} pointers · {{loose}} low-confidence, labelled not hidden</p>
+    <span class="badge {{acc_badge_class}}">{{acc_label}}</span>
+  </div>
+  <div class="card">
+    <h2>Forgetfulness</h2>
+    <p class="big">{{arch_size}}<small> ids recoverable</small></p>
+    <p>{{long_span_fires}} of {{fires}} fires reached into a summarised-away block · {{store_turns}} turns kept verbatim</p>
+    <span class="badge {{forget_badge_class}}">{{forget_label}}</span>
+  </div>
+  <div class="card">
+    <h2>Rework</h2>
+    <p class="big">{{repeat_topics}}<small> recurring topics</small></p>
+    <p>{{cross}} pointers came from other sessions — work never in this context</p>
+    <span class="badge {{rework_badge_class}}">{{rework_label}}</span>
+  </div>
+  <div class="card">
+    <h2>Cost</h2>
+    <p class="big">{{tok_turn}}<small> tokens / turn</small></p>
+    <p>{{ms_mean}} ms mean · {{tok_fire}} tokens per fire · max {{tok_max}}</p>
+    <span class="badge {{cost_badge_class}}">{{cost_label}}</span>
+  </div>
+</div>
+
+<section>
+  <h3>Pointer quality <span>— what came back, and how confident the match was</span></h3>
+  <div class="bar">
+    <i class="strict" style="width:{{strict_width}}%"></i>
+    <i class="loose" style="width:{{loose_width}}%"></i>
+    <i class="announce" style="width:{{announce_width}}%"></i>
+  </div>
+  <div class="legend">
+    <b>{{strict}}</b> strict multi-term spans · <b>{{loose}}</b> low-confidence partials ·
+    <b>{{announce}}</b> carve-out announcements
+  </div>
+  <table>
+    <tr><th>Axis</th><th>What the number says</th><th>How it is known</th></tr>
+    <tr><td>Accuracy</td><td>{{acc_text}}</td><td class="num">{{acc_label}}</td></tr>
+    <tr><td>Forgetfulness</td><td>{{forget_text}}</td><td class="num">{{forget_label}}</td></tr>
+    <tr><td>Rework</td><td>{{rework_text}}</td><td class="num">{{rework_label}}</td></tr>
+    <tr><td>Cost</td><td>{{cost_text}}</td><td class="num">{{cost_label}}</td></tr>
+  </table>
+</section>
+
+<section>
+  <h3>What is recoverable that used to be lost <span>— the forgetfulness axis</span></h3>
+  <p>Session <b>{{arch_session}}</b> has <b>{{store_turns}}</b> turns summarised away yet kept verbatim.
+  The archived pointer region spans ids <b>{{arch_lo}}–{{arch_hi}}</b> ({{arch_size}} ids). <b>{{long_span_fires}}</b>
+  of {{fires}} fires pointed into a block of 100+ ids — material the live context had already
+  summarised away. Before recall the compression boundary was destructive; now it is a cache miss.</p>
+</section>
+
+<section>
+  <h3>Is the same ground being covered twice? <span>— the rework axis</span></h3>
+  <p>Intent is not visible in a log, so this axis uses two measured proxies:
+  <b>{{repeat_topics}}</b> distinct topics matched in two or more separate fires
+  ({{top_repeat}}), and <b>{{cross}}</b> cross-session pointers — work this session never had
+  in context at all, so no amount of summarising could have preserved it.
+  Full read-back telemetry: <b>{{read_back}}</b>. The honest claim is therefore
+  &ldquo;rework was made avoidable&rdquo;, not &ldquo;N reruns were avoided&rdquo;.</p>
+</section>
+
+<section>
+  <h3>The cost model <span>— measured, then modelled</span></h3>
+  <table>
+    <tr><th>Term</th><th>Value</th><th>Status</th></tr>
+    <tr><td>Pointer cost per turn</td><td class="num">{{tok_turn}} tokens</td><td>measured</td></tr>
+    <tr><td>Tokens in the window</td><td class="num">{{tokens_total}} across {{fires}} fires</td><td>measured</td></tr>
+    <tr><td>Latency per fire</td><td class="num">{{ms_mean}} ms mean, {{ms_max}} ms max</td><td>measured</td></tr>
+    <tr><td>Cost of one full re-investigation</td><td class="num">{{rework_tokens}} tokens</td><td>assumption</td></tr>
+    <tr><td>Break-even repeat rate</td><td class="num">{{breakeven_pct}}%</td><td>derived</td></tr>
+    <tr><td>Measured baseline repeat rate</td><td class="num">{{baseline_pct}}%</td><td>measured earlier</td></tr>
+    <tr><td>Rework that must be prevented to break even</td><td class="num">{{avoid_pct}}% of fired-on rework</td><td>derived</td></tr>
+    <tr><td>Net tokens per turn if all rework is prevented</td><td class="num">{{net_tok_turn}}</td><td>model</td></tr>
+    <tr><td>Answer correctness, end to end</td><td class="num">{{read_back}}</td><td>not measured</td></tr>
+  </table>
+  <div class="note">Sensitivity: halve the rework assumption to 1500 tokens and break-even rises to
+  {{tok_turn_1500}}%; double it to 6000 and break-even falls to {{tok_turn_6000}}%. The verdict moves
+  with the assumption, which is why the assumption is printed next to it.</div>
+</section>
+
+<section>
+  <h3>What would flip the verdict</h3>
+  <ul class="limits">
+    <li>Read-back below 20% of fires → pointers are being paid for and ignored; fix the pointer
+    format, not the store.</li>
+    <li>Low-confidence share rising while strict hits do not → retrieval is regressing; retune the
+    terms and gates.</li>
+    <li>Recurring topics falling toward the break-even rate → recall is buying almost nothing;
+    the re-investigation cost assumption is too generous for this workload.</li>
+  </ul>
+</section>
+
+<section>
+  <h3>Reproduce</h3>
+<pre>python vr_value.py --level detailed --days 30     # this report, markdown
+python vr_value.py --html report.html             # this report, HTML
+python vr_stats.py --detail fires                 # every fire: span, tier, tokens
+python vr_stats.py --detail misses                # why a turn got no pointer
+python vr_stats.py --detail terms                 # top matched terms</pre>
+</section>
+
+<footer>Generated by vr_value.py from the verbatim-recall event log — numbers are read from the log, never typed by hand.</footer>
+
+</div>
+</body>
+</html>
