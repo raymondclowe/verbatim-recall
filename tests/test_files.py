@@ -90,6 +90,20 @@ class FileCorpusTest(unittest.TestCase):
         lines, _ = vr_files.lookup("update trail ridge road opening hours", idx=self.idx)
         self.assertEqual(len(lines), 1, lines)
 
+    def test_site_only_pointer_is_labelled_as_site_only(self):
+        # "update the opening hours" names no entity inside the site: the pointer must say
+        # it is the site's latest file, not pretend it is a record about opening hours.
+        lines, _ = vr_files.lookup("update the opening hours on castel-dell-ovo.com", idx=self.idx)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("latest file on castel-dell-ovo", lines[0])
+        self.assertIn("no word of this order matched beyond the site name", lines[0])
+
+    def test_instruction_verbs_are_not_entity_words(self):
+        # "refresh" is what to do to the record, not what the record is about
+        _, _, _ = vr_files._entities("x")
+        self.assertIn("refresh", vr_files.STOP)
+        self.assertIn("stale", vr_files.STOP)
+
     def test_no_entity_is_silence(self):
         lines, refs = vr_files.lookup("write the monthly performance review", idx=self.idx)
         self.assertEqual((lines, refs), ([], []))

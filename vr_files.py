@@ -76,6 +76,9 @@ until update updated up upon us use used useful using very visit want was way we
 well went were what when where whether which while who whole why will with within work
 worked working would write written year years yes yet you your row rows price prices
 opening hours close closed com www http https site_name value values name title cost
+# what to do to a record, never what the record is about
+stale refresh rebuild rewrite replace rework verify audit improve expand correct delete remove
+add move sync clean prune sweep recheck rename publish deploy migrate convert
 fee ticket restaurant restaurants hotel hotels
 """.split())
 
@@ -322,12 +325,15 @@ def _score(root, files, words, nums, ident=""):
     mtimes = {f[0]: f[1] for f in cand}
     hits = {}
     for rel, ts in found.items():
-        h = hits.setdefault(rel, [0.0, 0, mtimes.get(rel, 0), []])
+        # [score, terms matched, mtime, terms worth naming, terms that are not the site key]
+        h = hits.setdefault(rel, [0.0, 0, mtimes.get(rel, 0), [], set()])
         for w in ts:
             d = df.get(w, 1)
             weight = 0.2 if d > n * 0.6 else 1.0 + (1.0 - d / n)
             h[0] += weight
             h[1] += 1
+            if w != ident:
+                h[4].add(w)
             if w in nums:
                 h[0] += 1.5        # a row number is the narrowest handle there is
             # the site key is always worth naming in the pointer, however common it is --
@@ -429,13 +435,23 @@ def lookup(msg, top_k=3, idx=None):
             # site key itself, which is an identifier rather than a coincidence of vocabulary.
             if meta[3] != [key]:
                 continue
-        words = ", ".join(meta[3][:5])
         older = len(ranked) - 1
         tail = f"; +{older} more matching file{'s' if older != 1 else ''}" if older else ""
-        lines.append(
-            f"[verbatim-recall] file record for {_base(key)}: newest {_fmt_day(meta[2])} — "
-            f"{best} (matched: {words}{tail}) — read it before changing anything it names."
-        )
+        site_only = not (meta[4] - set(site_names))
+        if site_only:
+            # nothing in the order names an entity inside the site: hand over the site's
+            # newest record and say so plainly, rather than dress it up as a match.
+            lines.append(
+                f"[verbatim-recall] latest file on {_base(key)}: {_fmt_day(meta[2])} — {best} "
+                f"(no word of this order matched beyond the site name{tail}) — skim it if the "
+                f"job is site-wide."
+            )
+        else:
+            words = ", ".join(meta[3][:5])
+            lines.append(
+                f"[verbatim-recall] file record for {_base(key)}: newest {_fmt_day(meta[2])} — "
+                f"{best} (matched: {words}{tail}) — read it before changing anything it names."
+            )
         refs.append({"path": best, "key": key, "mtime": meta[2],
                      "terms": meta[3][:5], "score": round(meta[0], 2)})
         # a dated record naming the entity says what was decided; the aggregate store

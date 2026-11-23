@@ -177,6 +177,7 @@ Rules that keep it honest:
 | **Ranked by the entity's own words, newest first** | `daven haven lodge` + `1589` beats a file that merely repeats the site name; the row number is the narrowest handle there is. |
 | **A filename counts as evidence** | `2026-11-22-daven-haven-1589-field-fill.md` names the entity without being opened. |
 | **One shared word is not a match** | two agreeing terms, or the site key itself, or silence. |
+| **A site-only pointer says so** | when the order names no entity inside the site, the line reads `latest file on <site>` and says no word matched beyond the site name — it never dresses a guess up as a match. |
 | **No entity, no pointer** | "continue the work", "sweep the estate" return nothing rather than a guess. |
 | **Advisory only** | it prints a line; it never blocks, gates or reorders the work. |
 
