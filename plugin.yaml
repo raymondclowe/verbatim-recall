@@ -1,5 +1,5 @@
 name: verbatim-recall
-version: 0.4.0
+version: 0.4.1
 description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Silent otherwise."
 author: Hermes Agent
 license: MIT
@@ -134,9 +134,15 @@ config_schema:
 
   cross_session.pool:
     type: int
-    default: 400
+    default: 200
     label: Candidate pool
-    description: "Foreign turns fetched per query before scoring."
+    description: "Foreign turns fetched per query before scoring. Measured on an 846k-message store: 400 -> 213 ms/turn and 27 pointers in 40, 200 -> 125 ms and 30. Larger is not more accurate, only slower."
+
+  cross_session.df_probe:
+    type: int
+    default: 6
+    label: DF probe terms
+    description: "How many query words get their store-wide frequency probed (one query each) to pick the rarest for the MATCH. Raising it costs ~0.2-2.6 ms per term."
 
   cross_session.max_terms:
     type: int

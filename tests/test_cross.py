@@ -17,6 +17,8 @@ spec = importlib.util.spec_from_file_location("verbatim_recall", MOD)
 vr = importlib.util.module_from_spec(spec)
 sys.modules["verbatim_recall"] = vr
 spec.loader.exec_module(vr)
+vr.configure({"metrics.path": tempfile.mkdtemp(prefix="vr-tests-"),
+              "metrics.tag": "test"})
 
 AUX = "aux-session"          # the session asking the question
 OLD = "old-session"          # a foreign session that knows the answer

@@ -29,9 +29,26 @@ from datetime import datetime, timedelta
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES = os.path.join(HERE, "templates")
 
-DEFAULT_LOG_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share"),
-    "hermes", "logs", "verbatim-recall")
+
+def _default_log_dir() -> str:
+    """The plugin's own resolver, so this tool and vr_stats cannot disagree.
+
+    They did: this file hardcoded ~/.local/share/hermes/logs/verbatim-recall while
+    vr_stats asked the plugin (which resolves HERMES_HOME, hence the profile dir).
+    On a profile install vr_stats reported 17 events while vr_value said "No events
+    in the window" -- and vr_value is the tool that answers "is it worth it".
+    """
+    try:
+        sys.path.insert(0, HERE)
+        import verbatim_recall as _vr
+        return _vr.metrics_dir()
+    except Exception:
+        return os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share"),
+            "hermes", "logs", "verbatim-recall")
+
+
+DEFAULT_LOG_DIR = _default_log_dir()
 
 
 # ---------------------------------------------------------------- data loading

@@ -25,7 +25,10 @@ Since `0.3.0` it also looks **outside the current session**: if another session 
 agent holds the answer, you get a louder, explicitly low-confidence pointer naming the
 *other* session's id (see [Cross-session recall](#cross-session-recall-on-by-default)).
 
-Cost: ~5 ms per turn, **0 bytes on a miss**, ~120–500 tokens when it fires.
+Cost: the local index answers in **17–20 ms per turn** (measured, 1,786-turn region);
+cross-session recall adds one FTS pass, and that pass is what you pay for — see the
+measured figures in [Cross-session recall](#cross-session-recall-on-by-default). **0 bytes on a miss**,
+~80–300 tokens when it fires.
 
 ---
 
@@ -53,7 +56,9 @@ vocabulary. Four rules do the work:
 | **Derived text is not indexed** | summaries and process notices quote anything, so they match anything |
 | **Boilerplate is not evidence** | a term carried by >10% of the region (`output`, `error`, `exit_code`) is dropped |
 | **Only rare terms score in the strict tier** | one common word fakes a hit |
-| **Coverage decides, not score** | the matched turn must carry ≥45% of the *query's* IDF mass |
+| **A lone term must look like a handle** | "rare in this region" is not the same as "identifies a turn": `control` appears twice on a 1,635-turn archive and means nothing. Digits or a hash-length token only |
+| **Coverage decides, not score** | the matched turn must carry ≥45% of the *matchable* query's IDF mass |
+| **Ties are broken by (score, user before assistant, newest)** | an unnamed tie-break let the same query return three different pointers across five runs |
 
 And then the rule that matters most in practice:
 
@@ -99,8 +104,12 @@ Four properties make that pointer trustworthy enough to inject:
 | **Scored on the pool's own term statistics, gated relative to the pool's best** | a global IDF over the whole store would rank the loudest session, not the most relevant one |
 | **It shows the opening of the span** (`— opens: "…"`) | one line lets the model judge relevance without spending a read |
 
-Cost: one scoped FTS query plus a re-score, measured at **5–40 ms per turn** on a 20k-message
-store, **0 bytes injected on a miss**, and a cooldown (`cross_session.cooldown`, 6 turns per
+Cost: one scoped FTS pass plus a re-score. Measured on an 846k-message, 4 GB
+`state.db` with a 120–200-row pool: **125 ms mean, 118 ms median, 256 ms max per
+turn** with the cross pass on, against 18 ms with it off. On a 20k-message store the
+same pass is a fraction of that, but do not quote a single number for both — the
+cost is set by how many rows the query's commonest word matches, not by the code.
+**0 bytes injected on a miss**, and a cooldown (`cross_session.cooldown`, 6 turns per
 foreign session) so the same old session cannot be re-advertised every turn.
 
 ### Who is in scope
@@ -267,7 +276,8 @@ flat keys.
 | `cross_session.top_k` | `2` | foreign pointers per turn |
 | `cross_session.min_terms` | `3` | agreeing words required — one more than the local tier |
 | `cross_session.share` | `0.55` | matched IDF mass as a share of the pool's best turn |
-| `cross_session.pool` | `400` | candidate turns pulled from the FTS index before re-scoring |
+| `cross_session.pool` | `200` | candidate turns pulled from the FTS index before re-scoring (400 measured slower *and* found fewer foreign pointers) |
+| `cross_session.df_probe` | `6` | query words whose store-wide frequency is probed to pick the rarest for the MATCH (one cheap query each) |
 | `cross_session.max_terms` | `12` | query words used for the foreign fingerprint match |
 | `cross_session.cooldown` | `6` | turns before the same foreign session may be pointed at again |
 | `metrics.enabled` | `true` | write one JSON line per turn to the event log |
@@ -275,6 +285,7 @@ flat keys.
 | `metrics.retention_days` | `30` | day files older than this are deleted |
 | `metrics.store_terms` | `true` | keep matched query words; message bodies are never written |
 | `metrics.shadow_knobs` | `true` | also record what the gates threw away (false-negative watch) |
+| `metrics.tag` | `""` | written as `src` on every event; `"test"` in the suite, `"replay"` in `vr_replay` |
 
 **Too many weak pointers?** Raise `coverage` to 0.55, then `min_score`.
 Widen `boiler_df` if your region is small. **Missing things?** Lower
@@ -389,8 +400,18 @@ Placeholders are `{{name}}`; the generator fills them from the log and never han
   differ, and a foreign pointer costs ~200 extra tokens whenever it fires alongside a local one.
 * the cheapstem is a 6-character prefix, not a stemmer: `session`/`sessions` match (intended),
   `server`/`serves` also match (harmless in practice, wrong in principle).
+* FTS5 will not read `"word*"` as a prefix — the star has to be outside the quotes
+  (`"word"*`). The star-inside form silently matches **nothing**, so before 0.4.1 every
+  query word longer than six characters was a dead anchor and the cross-session pool was
+  only ever found through the short words.
 * a foreign pointer is a **dangling pointer risk**: if the owning session is pruned or deleted,
   the id no longer resolves. The label names the owner so a failed read is diagnosable.
+* the pointer's span starts at the matched turn. It used to start two ids earlier, and on a
+  compacted store id−2 is often a `[CONTEXT COMPACTION]` block — the reader landed on the
+  paraphrase this tool exists to replace.
+* the suite writes its metrics to a temp dir and tags every row `src="test"`. Before that it
+  wrote into the operator's live log, and `vr_stats.py` reported synthetic rows as traffic
+  ("9 of 17 turns fired, 6 pointers from other sessions" — all of them fixtures).
 * identity scoping compares `user_id` strings; a store that stamps a shared placeholder
   (`api` for every API client, for instance) cannot separate two humans by itself — set
   `cross_session.same_user_only: false` deliberately, or fix the stamps upstream.
