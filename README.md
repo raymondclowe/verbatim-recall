@@ -343,6 +343,38 @@ Two honesty rules are built into the report, because the obvious numbers lie:
 `vr_replay.py 60` replays the last 60 real user turns of a session through the real recall path.
 Use it when a log is empty and you want the report to have shape — with the caveat printed.
 
+### Answering "yes, but is it actually helping?" — `vr_value.py`
+
+`vr_stats` says what the plugin *did*; the question a user asks is what it *bought*: more
+accuracy, less forgetting, less rework, lower cost. `vr_value.py` renders that answer at two
+levels from the same log, using three templates in `templates/`:
+
+```bash
+python vr_value.py                             # high-level markdown reply (a few lines)
+python vr_value.py --level detailed            # full scorecard report, markdown
+python vr_value.py --html report.html          # self-contained HTML (examples/value-report-example.html)
+python vr_value.py --rework-tokens 5000 --baseline-repeat-pct 6   # change an assumption
+```
+
+Every line carries its provenance, so the reader can tell evidence from arithmetic:
+
+| Tag | Meaning |
+|---|---|
+| `MEASURED` | straight out of the event log |
+| `DERIVED` | arithmetic on measured numbers, printed with the numbers |
+| `MODEL` | needs an assumption; the assumption and a sensitivity band are printed next to it |
+| `NOT MEASURED` | cannot be observed from this data — printed as such, never as `0` |
+
+The cost argument is deliberately falsifiable. A pointer costs `tok_turn` tokens per turn;
+one full re-investigation is assumed to cost `--rework-tokens` (default 3000). Break-even
+repeat rate is their ratio. At 96 tokens/turn and 3000-token rework that is **3.2%**, so
+against a 5.3% measured baseline recall must prevent ~60% of the rework it fires on to pay
+for itself — a demanding bar, stated as such rather than hidden behind "it fired a lot".
+
+Templates are plain files, so they can be edited without touching code:
+`templates/reply-high-level.md`, `templates/reply-detailed.md`, `templates/value-report.html`.
+Placeholders are `{{name}}`; the generator fills them from the log and never hand-types a number.
+
 ---
 
 ## Limits, honestly
