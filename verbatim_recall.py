@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 # ---------------------------------------------------------------- config
 #
@@ -107,6 +107,20 @@ DEFAULTS: dict = {
     "cross_session.unattributed_sources": ["cli", "api_server"],
     # a2a rows are the same operator's other machines, each with its own user_id (ip:…)
     "cross_session.trusted_sources": ["a2a"],
+
+    # The second corpus: files, not transcripts. The session store answers "what was
+    # said"; it cannot answer "when was this venue last touched, and what was decided",
+    # because no turn in any transcript is the edit. The knowledge tree is: dated
+    # findings, briefs, pipeline state and patch files, keyed on the entities a work
+    # order actually names (site, site:row, card id, page slug). Lookup cost is
+    # O(entities in the message) against a cached index, so a fresh subagent opening a
+    # card pays one file read, not a scan.
+    "files.enabled": True,              # point at files as well as turns
+    "files.top_k": 3,                   # file pointers per turn
+    "files.roots": [],                  # "" = <hermes home>/wl-knowledge and ./wl-knowledge
+    "files.index": "",                  # "" = <hermes home>/cache/verbatim-recall/files-index.json
+    "files.refresh_hours": 6,           # 0 = never rebuild automatically
+    "files.rebuild_timeout": 120,       # seconds; a rebuild that overruns is abandoned
 
     # ---- measurement ------------------------------------------------------------
     # Whether the plugin works is not a matter of opinion: every turn writes one
@@ -206,6 +220,7 @@ def _apply() -> None:
     global CROSS_TRUSTED_PRINCIPALS, CROSS_UNATTRIBUTED
     global METRICS, METRICS_DIR, METRICS_RETENTION, METRICS_TERMS, METRICS_SHADOW
     global METRICS_TAG
+    global FILES, FILES_TOP_K, FILES_ROOTS, FILES_INDEX, FILES_REFRESH, FILES_TIMEOUT
     cfg = CONFIG
     QUIET = _as_bool(cfg.get("quiet"), DEFAULTS["quiet"])
     ANNOUNCE = _as_bool(cfg.get("announce"), DEFAULTS["announce"])
@@ -248,6 +263,13 @@ def _apply() -> None:
     METRICS_TERMS = _as_bool(cfg.get("metrics.store_terms"), DEFAULTS["metrics.store_terms"])
     METRICS_SHADOW = _as_bool(cfg.get("metrics.shadow_knobs"),
                               DEFAULTS["metrics.shadow_knobs"])
+    FILES = _as_bool(cfg.get("files.enabled"), DEFAULTS["files.enabled"])
+    FILES_TOP_K = _as_int(cfg.get("files.top_k"), DEFAULTS["files.top_k"])
+    FILES_ROOTS = tuple(_as_list(cfg.get("files.roots"), DEFAULTS["files.roots"]))
+    FILES_INDEX = str(cfg.get("files.index") or "").strip()
+    FILES_REFRESH = _as_int(cfg.get("files.refresh_hours"), DEFAULTS["files.refresh_hours"])
+    FILES_TIMEOUT = _as_int(cfg.get("files.rebuild_timeout"),
+                            DEFAULTS["files.rebuild_timeout"])
     METRICS_TAG = str(cfg.get("metrics.tag") or "").strip()
 
 
@@ -1313,6 +1335,7 @@ def report(days: int = 30, since: str = None, until: str = None,
     loose = sum(int(e.get("loose") or 0) for e in fires)
     same = sum(int(e.get("same") or 0) for e in fires)
     other = sum(int(e.get("cross") or 0) for e in fires)
+    fileptrs = sum(int(e.get("files") or 0) for e in fires)
     tokens = sum(int(e.get("tokens") or 0) for e in fires)
     ms = [float(e.get("ms") or 0) for e in fires]
 
@@ -1320,7 +1343,7 @@ def report(days: int = 30, since: str = None, until: str = None,
     for e in fires:
         by_fire[str(e.get("fire"))] = e
     read_fires = set()
-    read_tier = {"strict": 0, "loose": 0, "announce": 0, "other": 0}
+    read_tier = {"strict": 0, "loose": 0, "announce": 0, "other": 0, "file": 0}
     for e in uses:
         fid = str(e.get("fire"))
         f = by_fire.get(fid)
@@ -1393,7 +1416,7 @@ def report(days: int = 30, since: str = None, until: str = None,
         "announce_only": len([e for e in turns if e.get("ev") == "announce"]),
         "miss_reasons": why,
         "pointers": ptrs,
-        "pointer_tiers": {"strict": strict, "low_confidence": loose},
+        "pointer_tiers": {"strict": strict, "low_confidence": loose, "files": fileptrs},
         "pointer_origins": {"same_session": same, "other_session": other},
         "other_sessions": sorted(foreign.items(), key=lambda kv: -kv[1])[:10],
         "tokens": {
@@ -1539,7 +1562,10 @@ def recall(
                    turns=idx["n"] if idx else 0,
                    ms=round((time.perf_counter() - t0) * 1000, 1))
             return None
-        if not idx and not cross:
+        if not idx and not cross and not (FILES and not QUIET):
+            # A fresh session (a subagent's first turn, a cold one-shot run) has no
+            # compacted region at all -- but that is exactly the case the file layer
+            # exists for, so it must not be short-circuited here.
             metric("miss", session=session_id, why="no_index", turn=turn,
                    diag=diag if METRICS_SHADOW else None,
                    ms=round((time.perf_counter() - t0) * 1000, 1))
@@ -1601,6 +1627,15 @@ def recall(
                          # anyway; blanking them is done once, when the event is written.
                          "terms": sorted(terms)[:5]})
 
+        fptrs = []
+        if not QUIET:
+            # Files first: a dated record naming this exact entity is stronger evidence
+            # than any keyword match, and it is the only source a fresh subagent's first
+            # turn has — with no compacted region `match` cannot speak at all.
+            flines, fptrs = _files_lines(session_id, user_message, diag=diag)
+            lines.extend(flines)
+            ptrs.extend(fptrs)
+
         if cross:
             db_for_cross = cross_db or getattr(source, "path", None)
             if not db_for_cross and source is None:
@@ -1610,11 +1645,19 @@ def recall(
                 db_for_cross = getattr(hermes_source(), "path", None)
             clines, cptrs = _cross_lines(session_id, user_message, reader, qwords,
                                          db_for_cross, diag=diag)
+            if fptrs and cptrs:
+                # A work order that already resolved to a dated record needs no "another
+                # session may hold this" guess on top: it fires on boilerplate words
+                # (work, task, report) and pushes the real record down the page.
+                keep = [(l, p) for l, p in zip(clines, cptrs) if p["tier"] != "loose"]
+                clines = [l for l, _ in keep]
+                cptrs = [p for _, p in keep]
             lines.extend(clines)
             ptrs.extend(cptrs)
 
         if not lines:
             metric("miss", session=session_id, why="no_match", turn=turn,
+                   files_diag=diag.get("files", "absent"), files_cfg=FILES,
                    turns=idx["n"] if idx else 0,
                    diag=diag if METRICS_SHADOW else None,
                    ms=round((time.perf_counter() - t0) * 1000, 1))
@@ -1627,7 +1670,9 @@ def recall(
                    strict=len([p for p in ptrs if p["tier"] == "strict"]),
                    loose=len([p for p in ptrs if p["tier"] == "loose"]),
                    same=len([p for p in ptrs if p["o"] == session_id]),
-                   cross=len([p for p in ptrs if p["o"] != session_id]),
+                   cross=len([p for p in ptrs if p["o"] != session_id
+                              and p.get("tier") != "file"]),
+                   files=len([p for p in ptrs if p.get("tier") == "file"]),
                    tokens=max(1, len(text) // 4), chars=len(text),
                    turns=idx["n"] if idx else 0,
                    diag=diag if METRICS_SHADOW else None,
@@ -1645,6 +1690,79 @@ def recall(
         metric("miss", session=session_id, why="error", turn=turn,
                ms=round((time.perf_counter() - t0) * 1000, 1))
         return None
+
+
+_FILE_MOD = None
+_FILES_SEEN: dict = {}
+
+
+def _file_source():
+    """Load the sibling file-corpus module by path.
+
+    The plugin directory is hyphenated, so it is never importable by name; loading by
+    path keeps this working whether the host imports it as a package or a module.
+    """
+    global _FILE_MOD
+    if _FILE_MOD is not None:
+        return _FILE_MOD or None
+    try:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vr_files.py")
+        spec = importlib.util.spec_from_file_location("verbatim_recall_files", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FILE_MOD = mod
+    except Exception:
+        _FILE_MOD = False
+    return _FILE_MOD or None
+
+
+
+def _files_lines(session_id: str, user_message: str, diag: dict = None):
+    """Pointers into the record corpus: the file where this entity was last touched.
+
+    One pointer per entity per session — a file does not change between two turns of the
+    same conversation, and repeating it every turn is the nagging this plugin exists to
+    avoid. A miss here is silence, not a wrong guess.
+    """
+    try:
+        if not FILES:
+            return [], []
+        mod = _file_source()
+        if mod is None:
+            if diag is not None:
+                diag["files"] = "no-module"
+            return [], []
+        idx = mod.load(refresh=FILES_REFRESH * 3600,
+                       roots=list(FILES_ROOTS) or None,
+                       path=FILES_INDEX or None)
+        if not idx or not (idx.get("sites") or idx.get("ents")):
+            if diag is not None:
+                diag["files"] = "no-index"
+            return [], []
+        lines, refs = mod.lookup(user_message, top_k=FILES_TOP_K, idx=idx)
+        if not lines:
+            if diag is not None:
+                diag["files"] = 0
+            return [], []
+        if len(_FILES_SEEN) > 4096:
+            _FILES_SEEN.clear()
+        out, ptrs = [], []
+        for line, ref in zip(lines, refs):
+            seen = (session_id, ref["path"])
+            if seen in _FILES_SEEN:
+                continue
+            _FILES_SEEN[seen] = 1
+            out.append(line)
+            ptrs.append({"o": "file:" + ref["path"], "lo": 0, "hi": 0,
+                         "tier": "file", "terms": [], "path": ref["path"]})
+        if diag is not None:
+            diag["files"] = len(out)
+        return out, ptrs
+    except Exception:
+        if diag is not None:
+            diag["files"] = "error"
+        return [], []
 
 
 def _cross_lines(session_id: str, user_message: str, reader, qwords: int,
@@ -1804,3 +1922,5 @@ def _main(argv) -> int:
 
 if __name__ == "__main__":
     sys.exit(_main(sys.argv))
+
+

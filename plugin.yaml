@@ -1,6 +1,6 @@
 name: verbatim-recall
-version: 0.4.3
-description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Silent otherwise."
+version: 0.5.0
+description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Also indexes the dated files on this host (findings, patch records, run logs, card outputs) by the site, row, card and page they name, so a brand-new session — including a subagent's first turn, which has no transcript to search — opens with the dated record for the exact entity in its work order. Silent otherwise."
 author: Hermes Agent
 license: MIT
 
@@ -196,6 +196,42 @@ config_schema:
     default: ["cli", "api_server"]
     label: Sources that may ask anonymously
     description: "Surfaces that run as this operator but record no user_id. They see unrecorded rows; every other anonymous asker sees only its own."
+
+  files.enabled:
+    type: bool
+    default: true
+    label: Point at files
+    description: "Index the dated files on this host — findings, patch records, run logs, card outputs — by the site, row number, card id and page name they carry, and inject the dated record for the exact entity the turn names. This is the source that works in a session with no transcript of its own: a subagent's opening turn."
+
+  files.roots:
+    type: list
+    default: []
+    label: Roots to index
+    description: "Directories to scan. Empty = <hermes home>/wl-knowledge plus ./wl-knowledge. Non-text and oversized files are skipped."
+
+  files.refresh_hours:
+    type: float
+    default: 6
+    label: Index refresh (hours)
+    description: "Age at which the file index is rebuilt in the background. A stale index only produces older dates, never a wrong pointer."
+
+  files.top_k:
+    type: int
+    default: 3
+    label: File pointers per turn
+    description: "Maximum file records named for one turn. The exact row or card being named wins over the site's newest record."
+
+  files.index:
+    type: str
+    default: ""
+    label: Index file
+    description: "Where the index is cached. Empty = <hermes home>/cache/verbatim-recall/files-index.json."
+
+  files.rebuild_timeout:
+    type: int
+    default: 120
+    label: Rebuild timeout (seconds)
+    description: "A background rebuild that overruns is abandoned; the old index keeps serving."
 
   metrics.enabled:
     type: bool
