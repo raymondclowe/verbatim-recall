@@ -277,7 +277,8 @@ flat keys.
 | `cross_session.min_terms` | `3` | agreeing words required — one more than the local tier |
 | `cross_session.share` | `0.55` | matched IDF mass as a share of the pool's best turn |
 | `cross_session.pool` | `200` | candidate turns pulled from the FTS index before re-scoring (400 measured slower *and* found fewer foreign pointers) |
-| `cross_session.df_probe` | `6` | query words whose store-wide frequency is probed to pick the rarest for the MATCH (one cheap query each) |
+| `cross_session.df_probe` | `6` | query words whose store-wide frequency is probed before choosing the MATCH (one cheap query each) |
+| `cross_session.df_cap` | `5000` | a word carried by more rows than this cannot anchor the MATCH: on a large store one ubiquitous word (`"ubuntu"` = 48,376 rows) is the whole cost of the pass. Capped words still score; they just no longer fetch. Lower it (1500 measured 45 ms → 15 ms on a 25.6k-message store) to trade a little recall for speed |
 | `cross_session.max_terms` | `12` | query words used for the foreign fingerprint match |
 | `cross_session.cooldown` | `6` | turns before the same foreign session may be pointed at again |
 | `metrics.enabled` | `true` | write one JSON line per turn to the event log |

@@ -137,6 +137,10 @@ class CrossCost(unittest.TestCase):
     """The candidate query must not score every match in the store on every turn."""
 
     def setUp(self):
+        # save/restore the whole config: configure({}) resets to defaults, which would
+        # also drop this module's metrics.path/metrics.tag and starve later tests
+        self._cfg = dict(vr.CONFIG)
+        self.addCleanup(vr.configure, self._cfg)
         self.dir = tempfile.mkdtemp(prefix="vr-reg-db-")
         self.db = os.path.join(self.dir, "state.db")
         con = sqlite3.connect(self.db)
@@ -159,27 +163,69 @@ class CrossCost(unittest.TestCase):
         con.commit()
         con.close()
 
-    def test_the_rarest_terms_are_anded(self):
+    def test_a_common_term_does_not_anchor_the_match(self):
+        # 'ubuntu' is carried by 38 rows: it must not be the thing that fetches.
+        # Words the store does not use everywhere still fetch, in an OR -- an AND of the
+        # rarest terms is what silently lost pointers (see the fall-through test).
+        vr.configure({"cross_session.df_cap": 5})
         con = vr._connect_ro(self.db)
         try:
-            # four terms, one of them (ubuntu) carried by 38 rows: the common one must
-            # not be scored, because scoring it is what made every turn cost 95-135 ms
-            rows, q = vr._cross_pool(con, "probook ubuntu firmware rebuilt", "aux")
+            rows, q, rung, scored = vr._cross_pool(
+                con, "probook ubuntu firmware rebuilt", "aux")
         finally:
             con.close()
-        self.assertTrue(rows, "the AND ladder found nothing")
-        self.assertIn(" AND ", q, "still an OR over every term: %r" % q)
-        self.assertNotIn("ubuntu", q.lower(), "a common term is still being scored")
-        self.assertEqual(len(q.split(" AND ")), 3)
+        self.assertTrue(rows, "nothing found at all")
+        self.assertTrue(scored, "the rung returned nothing the scorer could use")
+        self.assertNotIn("ubuntu", q.lower(), "a common term is still anchoring the MATCH")
+        self.assertNotIn(" AND ", q, "narrowed with AND: %r" % q)
+        self.assertEqual(rung, "capped-or")
+
+    def test_a_row_tied_together_by_common_words_is_still_found(self):
+        """The regression this ladder exists for: rung 1 returns rows, none can score.
+
+        The only row that shares three query words shares three COMMON ones, so it can
+        never appear in a MATCH restricted to the rare words. Accepting rung 1 on
+        "returned some rows" left the turn with no pointer at all; the ladder has to
+        check that the rows can score before it settles.
+        """
+        con = sqlite3.connect(self.db)
+        # three common terms: 6 rows each, above the cap below
+        for i, word in enumerate(("kettle", "ledger", "throttle")):
+            for k in range(6):
+                con.execute("insert into messages (id, session_id, role, content) values "
+                            "(?, 'old', 'tool', ?)", (300 + i * 10 + k, "%s output" % word))
+        # two rare terms, each in one row, each alone: reachable, unscorable
+        con.execute("insert into messages (id, session_id, role, content) values "
+                    "(400,'old','tool','zircon reading')")
+        con.execute("insert into messages (id, session_id, role, content) values "
+                    "(401,'old','tool','quartzley reading')")
+        # the row that answers the question: three words, all of them common
+        con.execute("insert into messages (id, session_id, role, content) values "
+                    "(500,'old','user','kettle ledger throttle rebuild summary')")
+        con.executemany("insert into messages_fts (rowid, content) values (?,?)",
+                        [(r[0], r[1]) for r in
+                         con.execute("select id, content from messages where id >= 300").fetchall()])
+        con.commit()
+        con.close()
+        vr.configure({"cross_session.df_cap": 5})
+        con = vr._connect_ro(self.db)
+        try:
+            rows, q, rung, scored = vr._cross_pool(
+                con, "kettle ledger throttle zircon quartzley", "aux")
+        finally:
+            con.close()
+        ids = [r["id"] for r in scored]
+        self.assertIn(500, ids, "lost the row that only common words tie together (%r)" % (rung,))
+        self.assertEqual(rung, "all-or")
 
     def test_a_two_word_answer_is_still_reachable(self):
         con = vr._connect_ro(self.db)
         try:
             # one term is absent from the store: the ladder must loosen, not give up
-            rows, q = vr._cross_pool(con, "probook lemonspade firmware", "aux")
+            rows, q, rung, scored = vr._cross_pool(con, "probook lemonspade firmware", "aux")
         finally:
             con.close()
-        self.assertTrue(rows, "gave up instead of falling back to the rarest pair")
+        self.assertTrue(rows, "gave up instead of loosening the MATCH")
         self.assertTrue("proboo" in q or "firmwa" in q, "unexpected match string: %r" % q)
 
 

@@ -87,6 +87,7 @@ DEFAULTS: dict = {
     "cross_session.pool": 200,          # candidates re-scored in python (measured: 400 is slower AND less accurate)
     "cross_session.max_terms": 12,      # query terms sent to MATCH
     "cross_session.df_probe": 6,        # terms whose store-wide df is probed, one query each
+    "cross_session.df_cap": 5000,       # a term in more rows than this cannot anchor a MATCH
     "cross_session.cooldown": 6,        # turns before the same foreign session repeats
     "cross_session.sources": ["telegram", "api_server", "cli", "desktop", "mobile", "a2a"],
     # Identity scoping. On by default: a shared state.db must never quote another person's
@@ -175,6 +176,7 @@ CROSS_SHARE = 0.55
 CROSS_POOL = 200
 CROSS_MAX_TERMS = 12
 DF_PROBE_TERMS = 6
+DF_CAP = 5000
 CROSS_COOLDOWN = 6
 CROSS_SOURCES = ("telegram", "api_server", "cli", "desktop", "mobile", "a2a")
 CROSS_SAME_USER = True
@@ -193,7 +195,7 @@ def _apply() -> None:
     global LOOSE_SCORE, LOOSE_COVERAGE, LOOSE_TOP_K, COMMON_W, SPAN, PREVIEW, WINDOW
     global CROSS, CROSS_TOP_K, CROSS_MIN_TERMS, CROSS_SHARE, CROSS_POOL
     global CROSS_MAX_TERMS, CROSS_COOLDOWN, CROSS_SOURCES, CROSS_SAME_USER, CROSS_TRUSTED
-    global DF_PROBE_TERMS
+    global DF_PROBE_TERMS, DF_CAP
     global CROSS_TRUSTED_PRINCIPALS
     global METRICS, METRICS_DIR, METRICS_RETENTION, METRICS_TERMS, METRICS_SHADOW
     global METRICS_TAG
@@ -219,6 +221,7 @@ def _apply() -> None:
     CROSS_MAX_TERMS = _as_int(cfg.get("cross_session.max_terms"), DEFAULTS["cross_session.max_terms"])
     DF_PROBE_TERMS = _as_int(cfg.get("cross_session.df_probe"),
                              DEFAULTS["cross_session.df_probe"])
+    DF_CAP = _as_int(cfg.get("cross_session.df_cap"), DEFAULTS["cross_session.df_cap"])
     CROSS_COOLDOWN = _as_int(cfg.get("cross_session.cooldown"), DEFAULTS["cross_session.cooldown"])
     CROSS_SOURCES = tuple(_as_list(cfg.get("cross_session.sources"), DEFAULTS["cross_session.sources"]))
     CROSS_SAME_USER = _as_bool(cfg.get("cross_session.same_user_only"),
@@ -304,6 +307,7 @@ _announced: dict = {}      # session_id -> highest id already announced
 _cross_turn: dict = {}     # session_id -> turn counter, for the foreign-pointer cooldown
 _cross_seen: dict = {}     # (session_id, foreign_session_id) -> turn last pointed at
 _cross_last_query: str = ""  # last MATCH actually used, for the CLI's "match:" line
+_cross_last_rung: str = ""   # which rung of the ladder produced it
 _fts_ok: dict = {}         # db path -> bool (does this store have messages_fts?)
 
 
@@ -739,44 +743,68 @@ def _store_df(con, terms) -> dict:
 
 
 def _cross_pool(con, user_message: str, exclude_session_id: str, pool: int = None,
-                user_id: str = None):
-    """Candidate rows from the sharpest MATCH that still finds something, plus the query.
+                user_id: str = None, score=None):
+    """Candidate rows, the MATCH that produced them, and which rung that was.
 
-    The OR form scored every match in the store on every turn: "ubuntu" alone is
-    48,376 rows on this 846k-message store, and the join plus bm25 ordering over that
-    set measured 95-135 ms per call, 342 ms per turn end to end.
+    Cost and accuracy were conflated here. The expensive part of the old OR was never
+    "too many terms" -- it was that ONE ubiquitous word set the size of the match set:
+    "ubuntu" alone is 48,376 rows on an 846k-message store, and the join plus bm25 over
+    that measured 95-135 ms per call, 342 ms per turn end to end.
 
-    Probing df costs ~0.2 ms for a common term and the AND of the three rarest returns
-    single figures of rows. The scorer already demands CROSS_MIN_TERMS agreement, so
-    tightening the MATCH discards nothing the gate would have accepted -- it only
-    stops paying to score rows that were going to be rejected.
+    What this must NOT do is demand that the rarest terms co-occur. An earlier attempt
+    ANDed the three rarest terms and loosened only on an EMPTY result; it was fast, and
+    it silently dropped pointers whenever the winning row was tied together by a common
+    word instead of a rare one. Measured on a 25.6k-message store: 7 of 15 queries lost
+    every foreign pointer (the row matching {monthly, merge, savings} can never appear
+    in an AND of {monthly, spreadsheet, merge}, and a rung that returns rows the scorer
+    then rejects leaves the turn with no pointer at all).
 
-    Tightening cannot be done blind: the rarest terms may occur ONLY in the session
-    asking the question, and then the sharp query legitimately returns nothing. So the
-    ladder is tried against the real candidate query, sharpest first, and only an empty
-    result loosens it. Rarest-pair OR is the floor.
+    Fitness is the scorer's job, so the MATCH only has to be affordable and broad. The
+    ladder, each rung accepted only when it yields a row the scorer can actually use:
+
+      1. OR over the probed terms the store does not use everywhere
+         (df <= cross_session.df_cap), bm25-ordered while the union stays small;
+      2. OR over every probed term, newest-first and unsorted -- reaches rows that only
+         a common word ties together, and costs a scan instead of a ranking;
+      3. nothing: the pool is handed back anyway so `diag` can see what was considered.
     """
-    terms = list(dict.fromkeys(tokens(user_message)))[:max(1, min(CROSS_MAX_TERMS, DF_PROBE_TERMS))]
+    score = score_candidates if score is None else score
+    terms = list(dict.fromkeys(tokens(user_message)))
     if len(terms) < CROSS_MIN_TERMS:
-        return [], ''
-    df = _store_df(con, terms)
-    ranked = sorted([t for t in terms if df.get(t)], key=lambda t: df[t])
-    if len(ranked) < 2:
-        return [], ''
+        return [], '', '', []
+    probe = max(1, min(CROSS_MAX_TERMS, DF_PROBE_TERMS))
+    df = _store_df(con, terms[:probe])
+    known = [t for t in terms[:probe] if df.get(t)]
+    if len(known) < 2 and len(terms) > probe:
+        # a thin query (mostly words this store never used) may hide its only real
+        # anchors past the probe window; probing the rest costs ~0.2-2.6 ms per term
+        more = _store_df(con, terms[probe:probe * 2])
+        df.update(more)
+        known = [t for t in terms[:probe * 2] if df.get(t)]
+    if len(known) < 2:
+        return [], '', '', []
+    rungs = []
+    informative = [t for t in known if df[t] <= DF_CAP]
+    if len(informative) >= 2:
+        rungs.append((
+            'capped-or',
+            ' OR '.join(_fts_term(t) for t in informative),
+            sum(df[t] for t in informative) > DF_CAP * 4,
+        ))
+    rungs.append(('all-or', ' OR '.join(_fts_term(t) for t in known), True))
     seen = set()
-    for n in (min(3, len(ranked)), 2):
-        q = ' AND '.join(_fts_term(t) for t in ranked[:n])
+    rows: list = []
+    query = ''
+    for name, q, recent in rungs:
         if q in seen:
             continue
         seen.add(q)
-        # the AND set is at most the narrowest term's df; past a few thousand rows the
-        # bm25 sort dominates again, so take the newest pool instead of sorting them
-        wide = df[ranked[n - 1]] > 5000
-        rows = _cross_candidates(con, q, exclude_session_id, pool, user_id, recent=wide)
-        if rows:
-            return rows, q
-    q = ' OR '.join(_fts_term(t) for t in ranked[:2])
-    return _cross_candidates(con, q, exclude_session_id, pool, user_id, recent=True), q
+        rows = _cross_candidates(con, q, exclude_session_id, pool, user_id, recent=recent)
+        query = q
+        scored = score(rows, user_message) if rows else []
+        if scored:
+            return rows, q, name, scored
+    return rows, query, 'no-score', []
 
 
 def _cross_candidates(con, query: str, exclude_session_id: str, pool: int = None,
@@ -890,9 +918,10 @@ def cross_hits(session_id: str, user_message: str, db_path: str = None, top_k: i
             uid = (row["u"] if row else "") or ""
         except Exception:
             uid = ""
-        cands, query = _cross_pool(con, user_message, session_id, user_id=uid)
+        cands, query, rung, ranked = _cross_pool(
+            con, user_message, session_id, user_id=uid)
         globals()["_cross_last_query"] = query
-        ranked = score_candidates(cands, user_message)
+        globals()["_cross_last_rung"] = rung
         if not ranked:
             return []
         best: dict = {}
@@ -1608,7 +1637,7 @@ def _main(argv) -> int:
         t0 = time.time()
         hits = cross_hits(sid, rest, db_path=getattr(src, "path", None))
         dt = (time.time() - t0) * 1000.0
-        print(f"match: {_cross_last_query or q}")
+        print(f"match: {_cross_last_query or q}  [{_cross_last_rung or '?'}]")
         print(f"{len(hits)} foreign span(s) in {dt:.1f} ms "
               f"(pool {CROSS_POOL}, top_k {CROSS_TOP_K}, "
               f"min_terms {CROSS_MIN_TERMS}, share {CROSS_SHARE:.2f})")

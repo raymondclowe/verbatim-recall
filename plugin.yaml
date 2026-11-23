@@ -1,5 +1,5 @@
 name: verbatim-recall
-version: 0.4.1
+version: 0.4.2
 description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Silent otherwise."
 author: Hermes Agent
 license: MIT
@@ -142,7 +142,13 @@ config_schema:
     type: int
     default: 6
     label: DF probe terms
-    description: "How many query words get their store-wide frequency probed (one query each) to pick the rarest for the MATCH. Raising it costs ~0.2-2.6 ms per term."
+    description: "How many query words get their store-wide frequency probed (one query each) before the MATCH is chosen. Raising it costs ~0.2-2.6 ms per term."
+
+  cross_session.df_cap:
+    type: int
+    default: 5000
+    label: Common-term cap
+    description: "A query word occurring in more rows than this cannot anchor the candidate MATCH — one ubiquitous word ('ubuntu' = 48,376 rows on a large store) is what made the cross-session pass expensive. Excluded words still score; they just no longer fetch."
 
   cross_session.max_terms:
     type: int
