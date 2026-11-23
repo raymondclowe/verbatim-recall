@@ -112,6 +112,11 @@ def main(argv=None):
     if src.get("replay"):
         print("  NOTE: %d of %d events are a BACKFILL replay of real turns, not live "
               "gateway traffic." % (src["replay"], rep["events"]))
+    other = {k: v for k, v in src.items() if k not in ("live", "replay")}
+    if other:
+        print("  NOTE: %d events carry a non-live src (%s); they are included in the "
+              "totals below." % (sum(other.values()),
+                                  ", ".join("%s=%d" % (k, v) for k, v in sorted(other.items()))))
     print()
     for line in headline(rep):
         print(" " + line)

@@ -49,14 +49,14 @@ by id?* If yes, they become reclaimable.
 ## The gate (why it doesn't fire on everything)
 
 A naive matcher over a session archive matches everything, because everything shares
-vocabulary. Four rules do the work:
+vocabulary. These rules do the work:
 
 | Rule | Reason |
 |---|---|
 | **Derived text is not indexed** | summaries and process notices quote anything, so they match anything |
 | **Boilerplate is not evidence** | a term carried by >10% of the region (`output`, `error`, `exit_code`) is dropped |
 | **Only rare terms score in the strict tier** | one common word fakes a hit |
-| **A lone term must look like a handle** | "rare in this region" is not the same as "identifies a turn": `control` appears twice on a 1,635-turn archive and means nothing. Digits or a hash-length token only |
+| **A lone term must look like a handle** | "rare in this region" is not the same as "identifies a turn": `control` appears twice on a 1,635-turn archive and means nothing; `capitulation` is 12 letters and appears in 47 turns. Digits, an internal `_.-/`, or a hash-length token, **and** carried by at most two turns |
 | **Coverage decides, not score** | the matched turn must carry ≥45% of the *matchable* query's IDF mass |
 | **Ties are broken by (score, user before assistant, newest)** | an unnamed tie-break let the same query return three different pointers across five runs |
 
@@ -104,13 +104,14 @@ Four properties make that pointer trustworthy enough to inject:
 | **Scored on the pool's own term statistics, gated relative to the pool's best** | a global IDF over the whole store would rank the loudest session, not the most relevant one |
 | **It shows the opening of the span** (`— opens: "…"`) | one line lets the model judge relevance without spending a read |
 
-Cost: one scoped FTS pass plus a re-score. Measured on an 846k-message, 4 GB
-`state.db` with a 120–200-row pool: **125 ms mean, 118 ms median, 256 ms max per
-turn** with the cross pass on, against 18 ms with it off. On a 20k-message store the
-same pass is a fraction of that, but do not quote a single number for both — the
-cost is set by how many rows the query's commonest word matches, not by the code.
-**0 bytes injected on a miss**, and a cooldown (`cross_session.cooldown`, 6 turns per
-foreign session) so the same old session cannot be re-advertised every turn.
+Cost: one scoped FTS pass plus a re-score. Measured on a 4 GB `state.db` (846k max
+message id, 677k rows), warm, over 10 realistic queries: **147 ms mean, 127 ms
+median, 342 ms max per turn** with the cross pass on, against ~19 ms for the local
+pass. The cost is bimodal — the `capped-or` rung is 16–28 ms, while the `all-or`
+fallback is 227–342 ms warm and 0.6–1.1 s cold. It is set by how many rows the
+query's commonest word matches, not by the code. **0 bytes injected on a miss**, and
+a cooldown (`cross_session.cooldown`, 6 turns per foreign session) so the same old
+session cannot be re-advertised every turn.
 
 ### Who is in scope
 
@@ -276,8 +277,8 @@ flat keys.
 | `cross_session.top_k` | `2` | foreign pointers per turn |
 | `cross_session.min_terms` | `3` | agreeing words required — one more than the local tier |
 | `cross_session.share` | `0.55` | matched IDF mass as a share of the pool's best turn |
-| `cross_session.pool` | `200` | candidate turns pulled from the FTS index before re-scoring (400 measured slower *and* found fewer foreign pointers) |
-| `cross_session.df_probe` | `6` | query words whose store-wide frequency is probed before choosing the MATCH (one cheap query each) |
+| `cross_session.pool` | `200` | candidate turns pulled from the FTS index before re-scoring. 200 halves 400's candidates and is cheaper; on an 18-query replay it returned 15 pointers against main's 14, with one hit known to exist only past rank 200 |
+| `cross_session.df_probe` | `12` | query words whose store-wide frequency is probed before choosing the MATCH. The count is bounded at `df_cap + 1` rows (~0.7 ms for a ubiquitous word, ~6.5 ms for a prefix-heavy one); the default covers the full `max_terms` vocabulary so a rare anchor late in a long query is not dropped |
 | `cross_session.df_cap` | `5000` | a word carried by more rows than this cannot anchor the MATCH: on a large store one ubiquitous word (`"ubuntu"` = 48,376 rows) is the whole cost of the pass. Capped words still score; they just no longer fetch. Lower it (1500 measured 45 ms → 15 ms on a 25.6k-message store) to trade a little recall for speed |
 | `cross_session.max_terms` | `12` | query words used for the foreign fingerprint match |
 | `cross_session.cooldown` | `6` | turns before the same foreign session may be pointed at again |

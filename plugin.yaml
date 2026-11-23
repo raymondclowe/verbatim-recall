@@ -136,13 +136,13 @@ config_schema:
     type: int
     default: 200
     label: Candidate pool
-    description: "Foreign turns fetched per query before scoring. Measured on an 846k-message store: 400 -> 213 ms/turn and 27 pointers in 40, 200 -> 125 ms and 30. Larger is not more accurate, only slower."
+    description: "Foreign turns fetched per query before scoring. 200 halves the candidates of 400 and is cheaper; on an 18-query replay it returned 15 pointers against main's 14, with one hit known to exist only past rank 200. Larger is not more accurate here, only slower."
 
   cross_session.df_probe:
     type: int
-    default: 6
+    default: 12
     label: DF probe terms
-    description: "How many query words get their store-wide frequency probed (one query each) before the MATCH is chosen. Raising it costs ~0.2-2.6 ms per term."
+    description: "How many query words get their store-wide frequency probed before the MATCH is chosen. The count is bounded at df_cap+1 rows, so a ubiquitous word costs ~0.7 ms instead of 14.6 ms (a prefix-heavy term ~6.5 ms). Default covers the full max_terms vocabulary so a rare anchor late in a long query is not dropped."
 
   cross_session.df_cap:
     type: int
@@ -215,3 +215,9 @@ config_schema:
     default: true
     label: Record rejected candidates
     description: "Log what the gates threw away and how close it scored — the false-negative watch."
+
+  metrics.tag:
+    type: str
+    default: ""
+    label: Event source tag
+    description: "Written as src on every event. The suite sets test; vr_replay sets replay. Leave empty for live traffic."

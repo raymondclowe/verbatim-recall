@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.4.0"
+__version__ = "0.4.2"
 
 # ---------------------------------------------------------------- config
 #
@@ -86,7 +86,7 @@ DEFAULTS: dict = {
     "cross_session.share": 0.55,        # matched IDF mass, as a share of the pool's best turn
     "cross_session.pool": 200,          # candidates re-scored in python (measured: 400 is slower AND less accurate)
     "cross_session.max_terms": 12,      # query terms sent to MATCH
-    "cross_session.df_probe": 6,        # terms whose store-wide df is probed, one query each
+    "cross_session.df_probe": 12,       # terms whose store-wide df is probed (default: all)
     "cross_session.df_cap": 5000,       # a term in more rows than this cannot anchor a MATCH
     "cross_session.cooldown": 6,        # turns before the same foreign session repeats
     "cross_session.sources": ["telegram", "api_server", "cli", "desktop", "mobile", "a2a"],
@@ -425,13 +425,17 @@ def _derived(body: str) -> bool:
 
 
 def _identifier_like(term: str) -> bool:
-    """A lone term may stand alone only if it looks like a handle, not a word.
+    """Does this term look like a handle rather than an English word?
 
-    Digits, or long enough to be a hash/id fragment. Being merely rare in this
-    region is not the same claim -- "control" occurs twice on the live store and
-    means nothing, yet it was accepted as proof of identity.
+    Digits, an internal separator, or a token long enough to be a hash/id
+    fragment. Shape alone is not enough: the caller also requires the term to
+    be carried by at most two turns, because being rare in this region is not
+    the same claim as identifying a turn -- "capitulation" is 12 letters and
+    occurs in 47 turns of a live 1,889-turn region, and it is not a handle.
     """
-    return any(ch.isdigit() for ch in term) or len(term) >= 12
+    return (any(ch.isdigit() for ch in term)
+            or any(ch in "_.-/" for ch in term)
+            or len(term) >= 16)
 
 
 # ---------------------------------------------------------------- index
@@ -581,12 +585,14 @@ def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None,
         if sc < need:
             break
         terms = why[mid]
-        # Two agreeing terms, or one term so rare it is effectively an identifier.
-        # "Rare here" is not the same as "an identifier": on the live store "control"
-        # appears in 2 turns, so a query whose other 3 words were absent fired STRICT
-        # on it. A lone term now has to LOOK like a handle -- digits, a path, an
-        # underscore, a version/hex shape -- not merely be uncommon.
-        if len(terms) < MIN_TERMS and not _identifier_like(terms[0]):
+        # Two agreeing terms, or one term that both LOOKS like a handle and is
+        # carried by at most two turns. "Rare here" is not the same as "an
+        # identifier": on the live store "control" appears in 2 turns, so a query
+        # whose other 3 words were absent fired STRICT on it. Length alone is not
+        # a handle either: "capitulation" is 12 letters and appears in 47 turns.
+        if len(terms) < MIN_TERMS and not (
+                len(terms) == 1 and _identifier_like(terms[0])
+                and len(idx["inv"][terms[0]]) <= 2):
             gated_terms += 1
             continue
         if any(abs(mid - p[0]) < SPAN for p in picked):
@@ -730,13 +736,24 @@ def _fts_term(t: str) -> str:
 
 
 def _store_df(con, terms) -> dict:
-    """Document frequency of each term across the whole index. Measured 0.7 ms/term."""
+    """Document frequency of each term, bounded by the cap it is compared against.
+
+    ``count(*)`` over a ubiquitous word's full posting list is what cost 14.6 ms
+    per term on a live store ("output" = 283,728 rows), and the words that cost
+    the most are exactly the ones this probe exists to identify. The caller only
+    ever asks "is df <= df_cap", so stop counting at df_cap + 1 rows.
+    Measured: 0.67 ms for "output" instead of 14.6 ms. A prefix-heavy term
+    ("configuration" -> "config"*) still costs ~6.5 ms, because expanding the
+    prefix is itself the work.
+    """
     out = {}
+    limit = max(1, DF_CAP) + 1
     for t in terms:
         try:
             out[t] = int(con.execute(
-                "select count(*) from messages_fts where messages_fts match ?",
-                (_fts_term(t),)).fetchone()[0])
+                "select count(*) from (select rowid from messages_fts "
+                "where messages_fts match ? limit ?)",
+                (_fts_term(t), limit)).fetchone()[0])
         except Exception:
             out[t] = 0
     return out
@@ -764,34 +781,32 @@ def _cross_pool(con, user_message: str, exclude_session_id: str, pool: int = Non
 
       1. OR over the probed terms the store does not use everywhere
          (df <= cross_session.df_cap), bm25-ordered while the union stays small;
-      2. OR over every probed term, newest-first and unsorted -- reaches rows that only
-         a common word ties together, and costs a scan instead of a ranking;
+      2. OR over EVERY query term (probed or not, up to ``max_terms``), newest-first
+         and unsorted -- reaches rows that only a common word ties together, and
+         keeps a rare anchor past the probe window retrievable;
       3. nothing: the pool is handed back anyway so `diag` can see what was considered.
     """
     score = score_candidates if score is None else score
-    terms = list(dict.fromkeys(tokens(user_message)))
+    terms = list(dict.fromkeys(tokens(user_message)))[:CROSS_MAX_TERMS]
     if len(terms) < CROSS_MIN_TERMS:
         return [], '', '', []
-    probe = max(1, min(CROSS_MAX_TERMS, DF_PROBE_TERMS))
+    # Probe at most DF_PROBE_TERMS for cost, but the fallback MATCH carries the whole
+    # vocabulary. A prefix-only MATCH silently dropped a rare anchor at position 7 of
+    # a long query -- and the generic rows the fallback did fetch could still score on
+    # common words, so the turn got a WRONG pointer instead of none.
+    probe = max(1, min(len(terms), DF_PROBE_TERMS))
     df = _store_df(con, terms[:probe])
-    known = [t for t in terms[:probe] if df.get(t)]
-    if len(known) < 2 and len(terms) > probe:
-        # a thin query (mostly words this store never used) may hide its only real
-        # anchors past the probe window; probing the rest costs ~0.2-2.6 ms per term
-        more = _store_df(con, terms[probe:probe * 2])
-        df.update(more)
-        known = [t for t in terms[:probe * 2] if df.get(t)]
-    if len(known) < 2:
-        return [], '', '', []
+    informative = [t for t in terms[:probe] if df.get(t) and df[t] <= DF_CAP]
     rungs = []
-    informative = [t for t in known if df[t] <= DF_CAP]
-    if len(informative) >= 2:
+    if informative:
+        # one informative term is enough: a rare anchor is cheap to fetch, and the
+        # scorer still demands CROSS_MIN_TERMS agreeing words before a pointer.
         rungs.append((
             'capped-or',
             ' OR '.join(_fts_term(t) for t in informative),
             sum(df[t] for t in informative) > DF_CAP * 4,
         ))
-    rungs.append(('all-or', ' OR '.join(_fts_term(t) for t in known), True))
+    rungs.append(('all-or', ' OR '.join(_fts_term(t) for t in terms), True))
     seen = set()
     rows: list = []
     query = ''
@@ -1499,8 +1514,14 @@ def recall(
                          "terms": sorted(terms)[:5]})
 
         if cross:
+            db_for_cross = cross_db or getattr(source, "path", None)
+            if not db_for_cross and source is None:
+                # The plugin hook passes no source. The default source knows the store
+                # path, and the cross pass needs it; a caller-supplied callable stays
+                # single-session unless it opts in with cross_db (documented).
+                db_for_cross = getattr(hermes_source(), "path", None)
             clines, cptrs = _cross_lines(session_id, user_message, reader, qwords,
-                                         cross_db or getattr(source, "path", None))
+                                         db_for_cross)
             lines.extend(clines)
             ptrs.extend(cptrs)
 
@@ -1534,7 +1555,8 @@ def recall(
         return None
 
 
-def _cross_lines(session_id: str, user_message: str, reader, qwords: int, db_path: str):
+def _cross_lines(session_id: str, user_message: str, reader, qwords: int,
+                 db_path: str | None):
     """Foreign pointers, cooled down so one old session cannot nag on every turn."""
     try:
         if not db_path:

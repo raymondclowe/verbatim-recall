@@ -1,4 +1,5 @@
-"""Regressions for the four gate defects found on a live 846k-message store.
+"""Regressions for the gate, cross-session pool, hook and metrics defects found on a live
+846k-message store.
 
 Each test names the measured failure it prevents, because a threshold that is only
 "reasonable" cannot be reviewed -- but a number that was wrong can.
@@ -132,6 +133,27 @@ class AbsentWords(unittest.TestCase):
         hits = vr.match(idx, "zerblat rig calibration")
         self.assertEqual([h[3] for h in hits], ["strict"])
 
+    def test_a_long_ordinary_word_is_not_a_handle(self):
+        # Live: "capitulation" (12 letters) appears in 47 turns of a 1,889-turn region
+        # and fired STRICT alone. Length is not a handle, and df=12 is not <= 2.
+        rows = [{"id": i, "role": "assistant",
+                 "content": "Routine note %d about the harness." % i}
+                for i in range(1, 301)]
+        for mid in range(400, 412):
+            rows.append({"id": mid, "role": "assistant",
+                         "content": "the configuration was adjusted again %d" % mid})
+        idx = vr.build_index(rows)
+        hits = vr.match(idx, "zzqqxx nonsense configuration")
+        self.assertEqual([h for h in hits if h[3] == "strict"], [],
+                         "a long ordinary word still fires STRICT: %r" % (hits,))
+
+    def test_a_handle_shaped_rare_term_still_fires_strict(self):
+        # the positive control: shape (digit) AND df <= 2 still stands alone
+        rows = rows_for([(410, "user", "the sha256 digest matched the archive")])
+        idx = vr.build_index(rows)
+        hits = vr.match(idx, "zzqqxx nonsense sha256")
+        self.assertEqual([h[3] for h in hits], ["strict"])
+
 
 class CrossCost(unittest.TestCase):
     """The candidate query must not score every match in the store on every turn."""
@@ -227,6 +249,98 @@ class CrossCost(unittest.TestCase):
             con.close()
         self.assertTrue(rows, "gave up instead of loosening the MATCH")
         self.assertTrue("proboo" in q or "firmwa" in q, "unexpected match string: %r" % q)
+
+    def _reset_store(self, rows):
+        con = sqlite3.connect(self.db)
+        con.execute("delete from messages")
+        con.execute("delete from messages_fts")
+        con.executemany("insert into messages (id, session_id, role, content) values (?,?,?,?)",
+                        rows)
+        con.executemany("insert into messages_fts (rowid, content) values (?,?)",
+                        [(r[0], r[3]) for r in rows])
+        con.commit()
+        con.close()
+
+    def _cfg_with(self, **kv):
+        cfg = dict(vr.CONFIG)
+        cfg.update(kv)
+        return cfg
+
+    def test_one_informative_term_still_fetches_its_row(self):
+        # Other three words are above df_cap and 'rebuild' is absent: exactly one
+        # informative term. Requiring >=2 skipped the precise rung and let the
+        # newest-first OR return generic rows instead of the answer.
+        common = "ubuntu server output routine"
+        rows = [(10, "old", "user", "ubuntu server output firmware probook")]
+        rows += [(i, "old", "assistant", common) for i in range(100, 400)]
+        self._reset_store(rows)
+        vr.configure(self._cfg_with(**{"cross_session.df_cap": 20}))
+        con = vr._connect_ro(self.db)
+        try:
+            got, q, rung, scored = vr._cross_pool(
+                con, "ubuntu server output probook rebuild", "aux")
+        finally:
+            con.close()
+        self.assertIn(10, [r["id"] for r in scored],
+                      "lost the only rare anchor (%r)" % (rung,))
+        self.assertEqual(rung, "capped-or")
+
+    def test_a_rare_anchor_past_the_probe_window_is_still_reachable(self):
+        # Six ubiquitous words then the rare anchor at position 7. A MATCH built only
+        # from the probed prefix dropped it, and the generic fallback rows could still
+        # score on the six common words -- a wrong pointer, not a miss.
+        common = "alpha bravo delta gamma kappa sigma"
+        rows = [(10, "old", "user", common + " zircon")]
+        rows += [(i, "old", "assistant", common) for i in range(100, 400)]
+        self._reset_store(rows)
+        vr.configure(self._cfg_with(**{"cross_session.df_cap": 20}))
+        con = vr._connect_ro(self.db)
+        try:
+            got, q, rung, scored = vr._cross_pool(con, common + " zircon", "aux")
+        finally:
+            con.close()
+        self.assertIn(10, [r["id"] for r in scored],
+                      "a rare anchor at position 7 was dropped (%r)" % (rung,))
+        self.assertIn("zircon", q.lower(), "the fallback MATCH lost the anchor: %r" % q)
+        self.assertEqual(rung, "capped-or")
+
+
+class HookCross(unittest.TestCase):
+    """The plugin hook passes no source; the default source must still feed the cross pass."""
+
+    def setUp(self):
+        self._cfg = dict(vr.CONFIG)
+        self.addCleanup(vr.configure, self._cfg)
+        self.dir = tempfile.mkdtemp(prefix="vr-hook-db-")
+        self.db = os.path.join(self.dir, "state.db")
+        con = sqlite3.connect(self.db)
+        con.executescript(
+            "create table messages (id integer primary key, session_id text, role text,"
+            " content text, timestamp real, compacted integer default 0);"
+            "create table sessions (id text primary key, source text, user_id text,"
+            " title text, display_name text, started_at real, last_activity_at real);"
+            "create virtual table messages_fts using fts5(content);")
+        con.execute("insert into sessions values ('aux','telegram','me','asking','a',1.0,1.0)")
+        con.execute("insert into sessions values ('old','telegram','me','probook','p',1.0,1.0)")
+        con.execute("insert into messages (id,session_id,role,content) values "
+                    "(1,'old','user','probook rebuilt as ubuntu server, firmware fix')")
+        con.executemany("insert into messages_fts (rowid,content) values (?,?)",
+                        con.execute("select id,content from messages").fetchall())
+        con.commit()
+        con.close()
+        cfg = dict(vr.CONFIG)
+        cfg["db_path"] = self.db
+        vr.configure(cfg)
+
+    def test_recall_without_a_source_still_crosses(self):
+        vr._cache.clear()
+        vr._announced.clear()
+        vr._cross_turn.clear()
+        vr._cross_seen.clear()
+        block = vr.recall(session_id="aux",
+                          user_message="probook rebuilt ubuntu firmware", cross=True)
+        self.assertIsNotNone(block, "no pointer at all")
+        self.assertIn("ANOTHER SESSION", block["context"])
 
 
 class MetricsIsolated(unittest.TestCase):
