@@ -1,8 +1,13 @@
 name: verbatim-recall
-version: 0.4.2
+version: 0.4.3
 description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Silent otherwise."
 author: Hermes Agent
 license: MIT
+
+provides_hooks:
+  - pre_llm_call
+  - post_compaction
+  - post_tool_call
 
 # Every knob of this plugin is a YAML item here and nowhere else. Values are written to
 # config.yaml under plugins.entries.verbatim-recall.settings (a dotted key becomes a nested
