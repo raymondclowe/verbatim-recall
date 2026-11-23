@@ -186,6 +186,12 @@ config_schema:
     label: Trusted sources
     description: "Sources quoted whatever the principal — another machine of the same operator."
 
+  cross_session.unattributed_sources:
+    type: list
+    default: ["cli", "api_server"]
+    label: Sources that may ask anonymously
+    description: "Surfaces that run as this operator but record no user_id. They see unrecorded rows; every other anonymous asker sees only its own."
+
   metrics.enabled:
     type: bool
     default: true
