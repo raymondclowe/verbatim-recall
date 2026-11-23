@@ -6,6 +6,7 @@ Run:  python -m unittest discover -s tests -v     (stdlib only, no network, no D
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -14,6 +15,13 @@ spec = importlib.util.spec_from_file_location("verbatim_recall", MOD)
 vr = importlib.util.module_from_spec(spec)
 sys.modules["verbatim_recall"] = vr
 spec.loader.exec_module(vr)
+
+# The suite drives the real recall path, which writes one metrics event per call.
+# Before this it wrote them into the operator's live log: vr_stats.py cheerfully
+# reported "9 of 17 turns fired (53%), 6 from other sessions" built entirely from
+# synthetic rows. Temp dir, plus a tag for any harness that forgets to isolate.
+vr.configure({"metrics.path": tempfile.mkdtemp(prefix="vr-tests-"),
+              "metrics.tag": "test"})
 
 SID = "test-session"
 STRICT_ID = 120

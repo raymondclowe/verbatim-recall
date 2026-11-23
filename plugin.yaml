@@ -1,5 +1,5 @@
 name: verbatim-recall
-version: 0.4.0
+version: 0.4.2
 description: "Turns compaction summaries into pointers. Indexes the summarized-away region of the current session AND, cross-session, the rest of the store into id-ranged chunks with keyword fingerprints, and injects a one-line 'this exists, here is the id span, read it verbatim' pointer when the current turn matches — naming the owning session when the span lives elsewhere. Silent otherwise."
 author: Hermes Agent
 license: MIT
@@ -134,9 +134,21 @@ config_schema:
 
   cross_session.pool:
     type: int
-    default: 400
+    default: 200
     label: Candidate pool
-    description: "Foreign turns fetched per query before scoring."
+    description: "Foreign turns fetched per query before scoring. 200 halves the candidates of 400 and is cheaper; on an 18-query replay it returned 15 pointers against main's 14, with one hit known to exist only past rank 200. Larger is not more accurate here, only slower."
+
+  cross_session.df_probe:
+    type: int
+    default: 12
+    label: DF probe terms
+    description: "How many query words get their store-wide frequency probed before the MATCH is chosen. The count is bounded at df_cap+1 rows, so a ubiquitous word costs ~0.7 ms instead of 14.6 ms (a prefix-heavy term ~6.5 ms). Default covers the full max_terms vocabulary so a rare anchor late in a long query is not dropped."
+
+  cross_session.df_cap:
+    type: int
+    default: 5000
+    label: Common-term cap
+    description: "A query word occurring in more rows than this cannot anchor the candidate MATCH — one ubiquitous word ('ubuntu' = 48,376 rows on a large store) is what made the cross-session pass expensive. Excluded words still score; they just no longer fetch."
 
   cross_session.max_terms:
     type: int
@@ -203,3 +215,9 @@ config_schema:
     default: true
     label: Record rejected candidates
     description: "Log what the gates threw away and how close it scored — the false-negative watch."
+
+  metrics.tag:
+    type: str
+    default: ""
+    label: Event source tag
+    description: "Written as src on every event. The suite sets test; vr_replay sets replay. Leave empty for live traffic."
