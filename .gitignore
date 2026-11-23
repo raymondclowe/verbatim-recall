@@ -11,3 +11,7 @@ transcripts.jsonl
 venv/
 .DS_Store
 Thumbs.db
+
+# rendered sample reports
+report-example.html
+report-example.png
