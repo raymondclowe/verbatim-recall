@@ -173,3 +173,33 @@ config_schema:
     default: ["a2a"]
     label: Trusted sources
     description: "Sources quoted whatever the principal — another machine of the same operator."
+
+  metrics.enabled:
+    type: bool
+    default: true
+    label: Record metrics
+    description: "Write one local JSON line per turn: what was injected, and what the reader then read back."
+
+  metrics.path:
+    type: str
+    default: ""
+    label: Metrics directory
+    description: "Where the day files go. Empty = <hermes home>/logs/verbatim-recall."
+
+  metrics.retention_days:
+    type: int
+    default: 30
+    label: Retention (days)
+    description: "Day files older than this are deleted on the next write."
+
+  metrics.store_terms:
+    type: bool
+    default: true
+    label: Store matched terms
+    description: "Keep the query words that matched, so false positives can be diagnosed. Message bodies are never stored."
+
+  metrics.shadow_knobs:
+    type: bool
+    default: true
+    label: Record rejected candidates
+    description: "Log what the gates threw away and how close it scored — the false-negative watch."

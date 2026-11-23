@@ -99,6 +99,16 @@ DEFAULTS: dict = {
     "cross_session.trusted_principals": ["api"],
     # a2a rows are the same operator's other machines, each with its own user_id (ip:…)
     "cross_session.trusted_sources": ["a2a"],
+
+    # ---- measurement ------------------------------------------------------------
+    # Whether the plugin works is not a matter of opinion: every turn writes one
+    # line saying what it injected, and every time the agent reads a named span
+    # back another line says so. ``report`` turns the log into the answer.
+    "metrics.enabled": True,
+    "metrics.path": "",                 # "" = <hermes home>/logs/verbatim-recall
+    "metrics.retention_days": 30,       # day files older than this are deleted
+    "metrics.store_terms": True,        # keep matched query words; never message bodies
+    "metrics.shadow_knobs": True,       # record what the gates threw away (false-negative watch)
 }
 
 CONFIG: dict = dict(DEFAULTS)   # active settings, dotted keys as declared above
@@ -167,6 +177,11 @@ CROSS_SOURCES = ("telegram", "api_server", "cli", "desktop", "mobile", "a2a")
 CROSS_SAME_USER = True
 CROSS_TRUSTED = ("a2a",)
 CROSS_TRUSTED_PRINCIPALS = ("api",)
+METRICS = True
+METRICS_DIR = ""
+METRICS_RETENTION = 30
+METRICS_TERMS = True
+METRICS_SHADOW = True
 
 
 def _apply() -> None:
@@ -176,6 +191,7 @@ def _apply() -> None:
     global CROSS, CROSS_TOP_K, CROSS_MIN_TERMS, CROSS_SHARE, CROSS_POOL
     global CROSS_MAX_TERMS, CROSS_COOLDOWN, CROSS_SOURCES, CROSS_SAME_USER, CROSS_TRUSTED
     global CROSS_TRUSTED_PRINCIPALS
+    global METRICS, METRICS_DIR, METRICS_RETENTION, METRICS_TERMS, METRICS_SHADOW
     cfg = CONFIG
     QUIET = _as_bool(cfg.get("quiet"), DEFAULTS["quiet"])
     ANNOUNCE = _as_bool(cfg.get("announce"), DEFAULTS["announce"])
@@ -205,6 +221,13 @@ def _apply() -> None:
     CROSS_TRUSTED_PRINCIPALS = tuple(
         _as_list(cfg.get("cross_session.trusted_principals"),
                  DEFAULTS["cross_session.trusted_principals"]))
+    METRICS = _as_bool(cfg.get("metrics.enabled"), DEFAULTS["metrics.enabled"])
+    METRICS_DIR = str(cfg.get("metrics.path") or "").strip()
+    METRICS_RETENTION = _as_int(cfg.get("metrics.retention_days"),
+                                DEFAULTS["metrics.retention_days"])
+    METRICS_TERMS = _as_bool(cfg.get("metrics.store_terms"), DEFAULTS["metrics.store_terms"])
+    METRICS_SHADOW = _as_bool(cfg.get("metrics.shadow_knobs"),
+                              DEFAULTS["metrics.shadow_knobs"])
 
 
 def configure(overrides=None) -> dict:
@@ -475,10 +498,22 @@ def index_for(session_id: str, source=None):
     return idx
 
 
-def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None):
-    """Rank region messages against the query. Returns (id, score, terms, tier, coverage)."""
+def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None,
+          diag: dict = None):
+    """Rank region messages against the query. Returns (id, score, terms, tier, coverage).
+
+    ``diag``, when passed a dict, is filled with what the gates did to the candidates
+    (how many scored, how many trailed the coverage floor, how many were dropped for a
+    single term or for crowding another hit). That is the only honest way to see the
+    false negatives: material was there and a threshold refused it.
+    """
     top_k = TOP_K if top_k is None else top_k
     loose_top_k = LOOSE_TOP_K if loose_top_k is None else loose_top_k
+    if diag is not None:
+        diag.clear()
+        diag.update({"strict_cands": 0, "strict_below": 0, "strict_gated_terms": 0,
+                     "strict_gated_span": 0, "loose_cands": 0, "loose_below": 0,
+                     "loose_gated": 0})
     words = set(tokens(user_message))
     if not words or idx is None:
         return []
@@ -500,18 +535,26 @@ def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None):
             why.setdefault(mid, []).append(t)
 
     picked = []
+    gated_terms = gated_span = 0
     for mid, sc in sorted(scores.items(), key=lambda kv: -kv[1]):
         if sc < need:
             break
         terms = why[mid]
         # two agreeing terms, or one term so rare it is effectively an identifier
         if len(terms) < MIN_TERMS and len(idx["inv"][terms[0]]) > 2:
+            gated_terms += 1
             continue
         if any(abs(mid - p[0]) < SPAN for p in picked):
+            gated_span += 1
             continue
         picked.append((mid, sc, terms, "strict", sc / qmass))
         if len(picked) >= min(top_k, 4):
             break
+    if diag is not None:
+        diag["strict_cands"] = len(scores)
+        diag["strict_below"] = sum(1 for v in scores.values() if v < need)
+        diag["strict_gated_terms"] = gated_terms
+        diag["strict_gated_span"] = gated_span
     if picked:
         return picked
 
@@ -526,6 +569,7 @@ def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None):
             lwhy.setdefault(mid, []).append(t)
 
     out = []
+    lgated = 0
     for mid, sc in sorted(lsc.items(), key=lambda kv: -kv[1]):
         if sc < need_loose:
             break
@@ -533,12 +577,18 @@ def match(idx, user_message: str, top_k: int = None, loose_top_k: int = None):
         rare_hit = [t for t in terms if t in idx["rare"]]
         # a single word is enough only when it is near-identifier rare
         if len(terms) < 2 and not (rare_hit and len(idx["inv"][rare_hit[0]]) <= 5):
+            lgated += 1
             continue
         if any(abs(mid - p[0]) < SPAN for p in out):
+            lgated += 1
             continue
         out.append((mid, sc, terms, "loose", sc / qmass))
         if len(out) >= max(1, min(loose_top_k, 2)):
             break
+    if diag is not None:
+        diag["loose_cands"] = len(lsc)
+        diag["loose_below"] = sum(1 for v in lsc.values() if v < need_loose)
+        diag["loose_gated"] = lgated
     return out
 
 
@@ -767,6 +817,440 @@ def _cross_line(hit, reader, qwords: list, kmap: dict) -> str:
     return body + " -> " + reader(hit["lo"], hit["session_id"])
 
 
+# ---------------------------------------------------------------- metrics
+#
+# Measurement, not telemetry: one JSON line per event in a local directory — no
+# network, no message bodies, no credentials. Four event kinds:
+#
+#   fire    pointers went into the context this turn (how many, which tier, how far)
+#   miss    nothing to say this turn, and why (no_index, no_match, quiet, error)
+#   use     the agent read a named span back — the only observable proof of value
+#   search  the agent searched this session with no pointer in hand
+#
+# The three questions a report has to answer, and how far it honestly can:
+#   is it firing?      exact — fire vs miss on every turn of every session.
+#   false positive?    a *proxy*: a fire whose span was never read back. That is not
+#                      the same as irrelevant (the agent may not have needed it), so
+#                      the report calls it "unread", never "wrong".
+#   false negative?    *candidates*: turns where a gate refused material that scored
+#                      (see ``diag`` in match()), or where the agent searched this
+#                      session without a pointer. Both say "look here", not "missed".
+
+_MET_LOCK = threading.Lock()
+_met_pruned = False
+_turn_no: dict = {}
+_pending: dict = {}     # session_id -> [{fire, turn, spans:[[owner, lo, hi]], used}]
+
+
+def metrics_dir() -> str:
+    """``metrics.path``, else <hermes home>/logs/verbatim-recall."""
+    return (METRICS_DIR or "").strip() or os.path.join(_hermes_home(), "logs",
+                                                       "verbatim-recall")
+
+
+def _metrics_file(day: str = None) -> str:
+    day = day or time.strftime("%Y-%m-%d")
+    return os.path.join(metrics_dir(), "events-%s.jsonl" % day)
+
+
+def _prune_metrics() -> None:
+    global _met_pruned
+    if _met_pruned or METRICS_RETENTION <= 0:
+        return
+    _met_pruned = True
+    try:
+        cutoff = time.time() - METRICS_RETENTION * 86400
+        d = metrics_dir()
+        for name in os.listdir(d):
+            if not (name.startswith("events-") and name.endswith(".jsonl")):
+                continue
+            p = os.path.join(d, name)
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+    except Exception:
+        pass
+
+
+def metric(ev: str, **fields) -> None:
+    """Append one event line. Fail-open: measurement must never break a turn."""
+    if not METRICS:
+        return
+    try:
+        rec = {"ev": ev, "ts": round(time.time(), 3),
+               "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        rec.update({k: v for k, v in fields.items() if v is not None})
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+        with _MET_LOCK:
+            _prune_metrics()
+            path = _metrics_file()
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _day_window(days: int = 30, since: str = None, until: str = None) -> tuple:
+    """Resolve ``--since``/``--until`` (YYYY-MM-DD, inclusive) or a day count into a
+    ``(lo_ts, hi_ts)`` pair. ``until`` covers the whole named day."""
+    def _ts(s, end=False):
+        try:
+            t = time.mktime(time.strptime(str(s)[:10], "%Y-%m-%d"))
+        except Exception:
+            return None
+        return t + 86399.999 if end else t
+    hi = _ts(until, end=True) if until else None
+    lo = _ts(since) if since else None
+    if lo is None:
+        lo = (hi if hi is not None else time.time()) - max(1, days) * 86400
+    if hi is None:
+        hi = float("inf")
+    return float(lo), float(hi)
+
+
+def load_metrics(days: int = 30, since: str = None, until: str = None) -> list:
+    """Every event from the day files inside the window, oldest first."""
+    out = []
+    d = metrics_dir()
+    if not os.path.isdir(d):
+        return out
+    cutoff, ceiling = _day_window(days, since, until)
+    try:
+        names = sorted(os.listdir(d))
+    except Exception:
+        return out
+    for name in names:
+        if not (name.startswith("events-") and name.endswith(".jsonl")):
+            continue
+        p = os.path.join(d, name)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                continue
+            with open(p, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = float(rec.get("ts") or 0)
+                    if cutoff <= ts <= ceiling:
+                        out.append(rec)
+        except Exception:
+            continue
+    out.sort(key=lambda r: r.get("ts") or 0)
+    return out
+
+
+def _next_turn(session_id: str) -> int:
+    turn = _turn_no.get(session_id, 0) + 1
+    _turn_no[session_id] = turn
+    if len(_turn_no) > 512:
+        _turn_no.clear()
+        _turn_no[session_id] = turn
+    return turn
+
+
+def _add_pending(session_id: str, fire: str, turn: int, spans: list) -> None:
+    """Remember what this turn offered, so a later read can be attributed to it."""
+    lst = _pending.setdefault(session_id, [])
+    lst.append({"fire": fire, "turn": turn, "spans": spans, "used": False})
+    del lst[:-12]
+    if len(_pending) > 512:
+        _pending.clear()
+        _pending[session_id] = lst
+
+
+def _arg(payload, name: str):
+    """Field from a tool call's arguments, whether dict or raw JSON text."""
+    try:
+        if isinstance(payload, dict):
+            return payload.get(name)
+        if isinstance(payload, str):
+            m = re.search(r'["\']?%s["\']?\s*[:=]\s*["\']?(-?\d+|[^,\s}\'\"]+)' % name, payload)
+            return m.group(1) if m else None
+    except Exception:
+        pass
+    return None
+
+
+def on_tool_call(tool_name: str = "", arguments=None, args=None, session_id: str = "",
+                 **kwargs) -> None:
+    """Attribute a ``session_search`` to the pointer that named that span, if any.
+
+    This is the whole usefulness measurement: a pointer is only demonstrably useful
+    when the id it printed is the id that got read. A search that matches nothing we
+    offered is recorded too — either the pointers went unread, or the span the agent
+    wanted was not offered (a false-negative candidate).
+    """
+    if not METRICS:
+        return None
+    try:
+        if (tool_name or "").strip() != "session_search":
+            return None
+        # The hook carries session_id, and conversation_id stays stable across a
+        # compression rotation — look under all of them, or a fire recorded before
+        # the rotation would look unread for ever.
+        keys = [k for k in (session_id,
+                            kwargs.get("conversation_id"),
+                            kwargs.get("task_id")) if k]
+        sess = keys[0] if keys else ""
+        payload = arguments if arguments is not None else args
+        asked = _arg(payload, "around_message_id")
+        owner = _arg(payload, "session_id")
+        try:
+            asked = int(asked)
+        except (TypeError, ValueError):
+            asked = None
+        if isinstance(owner, str):
+            owner = owner.strip().strip("'\"") or None
+        rec = span = None
+        for k in keys:
+            for cand in _pending.get(k) or []:
+                if cand.get("used"):
+                    continue
+                for sp in cand["spans"]:
+                    if owner and sp[0] and owner != sp[0]:
+                        continue
+                    if asked is not None:
+                        if sp[1] <= asked <= sp[2]:
+                            rec, span = cand, sp
+                            break
+                    elif owner:
+                        rec, span = cand, sp
+                        break
+                if rec:
+                    break
+            if rec:
+                break
+        if rec and span:
+            rec["used"] = True
+            metric("use", session=sess, fire=rec["fire"], owner=span[0],
+                   asked=asked, turn=rec["turn"])
+        else:
+            pending = [c for lst in (_pending.get(k) or [] for k in keys)
+                       for c in lst if not c.get("used")]
+            metric("search", session=sess, owner=owner, asked=asked,
+                   after_fire=bool(pending), pending=len(pending))
+    except Exception:
+        pass
+    return None
+
+
+def _pct(part, whole) -> str:
+    return "%d%%" % round(100.0 * part / whole) if whole else "—"
+
+
+def report(days: int = 30, since: str = None, until: str = None,
+           session: str = None) -> dict:
+    """Aggregate the event log into the answer to "is this thing working?"."""
+    evs = load_metrics(days, since, until)
+    if session:
+        evs = [e for e in evs if not e.get("session") or e.get("session") == session]
+    sources = {}
+    for e in evs:
+        k = str(e.get("src") or "live")
+        sources[k] = sources.get(k, 0) + 1
+    turns = [e for e in evs if e.get("ev") in ("fire", "miss", "announce")]
+    fires = [e for e in evs if e.get("ev") == "fire"]
+    misses = [e for e in evs if e.get("ev") == "miss"]
+    uses = [e for e in evs if e.get("ev") == "use"]
+    searches = [e for e in evs if e.get("ev") == "search"]
+
+    why: dict = {}
+    for e in misses:
+        why[str(e.get("why") or "?")] = why.get(str(e.get("why") or "?"), 0) + 1
+
+    ptrs = sum(int(e.get("ptr") or 0) for e in fires)
+    strict = sum(int(e.get("strict") or 0) for e in fires)
+    loose = sum(int(e.get("loose") or 0) for e in fires)
+    same = sum(int(e.get("same") or 0) for e in fires)
+    other = sum(int(e.get("cross") or 0) for e in fires)
+    tokens = sum(int(e.get("tokens") or 0) for e in fires)
+    ms = [float(e.get("ms") or 0) for e in fires]
+
+    by_fire = {}
+    for e in fires:
+        by_fire[str(e.get("fire"))] = e
+    read_fires = set()
+    read_tier = {"strict": 0, "loose": 0, "announce": 0, "other": 0}
+    for e in uses:
+        fid = str(e.get("fire"))
+        f = by_fire.get(fid)
+        if not f:
+            continue
+        read_fires.add(fid)
+        asked = e.get("asked")
+        tier = None
+        if asked is not None:
+            for p in f.get("ptrs") or []:
+                if p.get("o") != e.get("owner"):
+                    continue
+                if int(p.get("lo") or 0) <= int(asked) <= int(p.get("hi") or 0):
+                    tier = ("other" if p.get("o") != f.get("session")
+                            else (p.get("tier") or "strict"))
+                    break
+        if tier is None:
+            tier = "strict"
+        if tier in read_tier:
+            read_tier[tier] += 1
+
+    gated_turns = 0
+    gated_total = 0
+    for e in turns:
+        d = e.get("diag") or {}
+        g = int(d.get("strict_gated_terms") or 0) + int(d.get("strict_gated_span") or 0) \
+            + int(d.get("loose_gated") or 0)
+        if g:
+            gated_turns += 1
+            gated_total += g
+
+    terms: dict = {}
+    for e in fires:
+        for p in e.get("ptrs") or []:
+            for t in p.get("terms") or []:
+                terms[str(t)] = terms.get(str(t), 0) + 1
+
+    foreign: dict = {}
+    for e in fires:
+        for p in e.get("ptrs") or []:
+            if p.get("o") and p.get("o") != e.get("session"):
+                foreign[str(p["o"])] = foreign.get(str(p["o"]), 0) + 1
+
+    per_day: dict = {}
+    for e in turns:
+        day = str(e.get("at") or "")[:10]
+        row = per_day.setdefault(day, {"turns": 0, "fires": 0, "ptrs": 0, "reads": 0})
+        row["turns"] += 1
+        if e.get("ev") == "fire":
+            row["fires"] += 1
+            row["ptrs"] += int(e.get("ptr") or 0)
+    for day, row in per_day.items():
+        row["reads"] = len({str(e.get("fire")) for e in uses
+                            if str(e.get("at") or "")[:10] == day})
+
+    rep = {
+        "sources": sources,
+        "window_days": days,
+        "window": {"since": since, "until": until, "session": session},
+        "log_dir": metrics_dir(),
+        "log_files": len([n for n in (os.listdir(metrics_dir())
+                                      if os.path.isdir(metrics_dir()) else [])
+                          if n.startswith("events-")]),
+        "events": len(evs),
+        "first": (evs[0].get("at") if evs else None),
+        "last": (evs[-1].get("at") if evs else None),
+        "turns": len(turns),
+        "fires": len(fires),
+        "fire_rate": (len(fires) / float(len(turns))) if turns else 0.0,
+        "announce_only": len([e for e in turns if e.get("ev") == "announce"]),
+        "miss_reasons": why,
+        "pointers": ptrs,
+        "pointer_tiers": {"strict": strict, "low_confidence": loose},
+        "pointer_origins": {"same_session": same, "other_session": other},
+        "other_sessions": sorted(foreign.items(), key=lambda kv: -kv[1])[:10],
+        "tokens": {
+            "total": tokens,
+            "per_fire": round(tokens / float(len(fires)), 1) if fires else 0,
+            "per_turn": round(tokens / float(len(turns)), 1) if turns else 0,
+            "max": max([int(e.get("tokens") or 0) for e in fires] or [0]),
+        },
+        "latency_ms": {
+            "mean": round(sum(ms) / len(ms), 1) if ms else 0,
+            "max": round(max(ms), 1) if ms else 0,
+        },
+        "reads": {
+            "read_back_events": len(uses),
+            "fires_with_a_read": len(read_fires),
+            "read_rate": (len(read_fires) / float(len(fires))) if fires else 0.0,
+            "by_tier": read_tier,
+            "unread_fires": max(0, len(fires) - len(read_fires)),
+        },
+        "false_negative_candidates": {
+            "searches_without_pointer": len([e for e in searches
+                                             if not e.get("after_fire")]),
+            "searches_while_pointers_pending": len([e for e in searches
+                                                    if e.get("after_fire")]),
+            "gated_turns": gated_turns,
+            "gated_candidates": gated_total,
+        },
+        "top_terms": sorted(terms.items(), key=lambda kv: -kv[1])[:12],
+        "per_day": [dict(day=k, **v) for k, v in sorted(per_day.items())],
+    }
+    return rep
+
+
+def format_report(rep: dict) -> str:
+    """The same numbers, as the block of text a person reads."""
+    L = []
+    L.append("verbatim-recall report — last %d days" % rep["window_days"])
+    L.append("  log   %s (%d file(s), %d events)"
+             % (rep["log_dir"], rep["log_files"], rep["events"]))
+    if not rep["events"]:
+        L.append("")
+        L.append("  no events yet. The plugin writes one line per turn; if this stays")
+        L.append("  empty, check metrics.enabled and that the dir is writable.")
+        return "\n".join(L)
+    L.append("  span  %s → %s" % (rep["first"], rep["last"]))
+    L.append("")
+    L.append("firing")
+    L.append("  turns observed        %d" % rep["turns"])
+    L.append("  turns with pointers   %d  (%s)"
+             % (rep["fires"], _pct(rep["fires"], rep["turns"])))
+    L.append("  pointers injected     %d  (high confidence %d, low confidence %d)"
+             % (rep["pointers"], rep["pointer_tiers"]["strict"],
+                rep["pointer_tiers"]["low_confidence"]))
+    L.append("  origin                %d same-session, %d other-session"
+             % (rep["pointer_origins"]["same_session"],
+                rep["pointer_origins"]["other_session"]))
+    if rep["other_sessions"]:
+        L.append("  other sessions        " + ", ".join(
+            "%s×%d" % (k, v) for k, v in rep["other_sessions"]))
+    L.append("  tokens injected       %d total, %s per fire, %s per turn, max %d"
+             % (rep["tokens"]["total"], rep["tokens"]["per_fire"],
+                rep["tokens"]["per_turn"], rep["tokens"]["max"]))
+    L.append("  latency               %s ms mean, %s ms max"
+             % (rep["latency_ms"]["mean"], rep["latency_ms"]["max"]))
+    L.append("")
+    L.append("usefulness (proxy: did the agent read the id we printed?)")
+    L.append("  fires read back       %d of %d  (read rate %s)"
+             % (rep["reads"]["fires_with_a_read"], rep["fires"],
+                _pct(rep["reads"]["fires_with_a_read"], rep["fires"])))
+    _bt = rep["reads"]["by_tier"]
+    L.append("  read by tier          high confidence %d, low confidence %d, "
+             "other-session %d, announcement %d"
+             % (_bt.get("strict", 0), _bt.get("loose", 0),
+                _bt.get("other", 0), _bt.get("announce", 0)))
+    L.append("  unread fires          %d  (a false-positive *proxy*, not proof)"
+             % rep["reads"]["unread_fires"])
+    fn = rep["false_negative_candidates"]
+    L.append("")
+    L.append("false-negative watch")
+    L.append("  searched, no pointer  %d  (agent looked anyway — candidate miss)"
+             % fn["searches_without_pointer"])
+    L.append("  searched, pending     %d  (pointers were offered and not read)"
+             % fn["searches_while_pointers_pending"])
+    L.append("  gated by thresholds   %d candidates across %d turns  (material scored, a gate refused it)"
+             % (fn["gated_candidates"], fn["gated_turns"]))
+    if rep["miss_reasons"]:
+        L.append("  turns, no pointer     " + ", ".join(
+            "%s %d" % (k, v) for k, v in sorted(rep["miss_reasons"].items(),
+                                                key=lambda kv: -kv[1])))
+    if rep["top_terms"]:
+        L.append("")
+        L.append("top matched terms       " + ", ".join(
+            "%s(%d)" % (k, v) for k, v in rep["top_terms"]))
+    if rep["per_day"]:
+        L.append("")
+        L.append("per day")
+        for row in rep["per_day"][-14:]:
+            L.append("  %s  turns %3d  fires %3d  pointers %3d  read %3d"
+                     % (row["day"], row["turns"], row["fires"], row["ptrs"], row["reads"]))
+    return "\n".join(L)
+
+
 # ---------------------------------------------------------------- render / hooks
 
 def recall(
@@ -792,14 +1276,27 @@ def recall(
     ``.path`` (the built-in sources do) or when ``cross_db`` names one. A caller passing
     its own callable therefore stays single-session unless it opts in with ``cross_db``.
     """
-    if QUIET or not session_id or not (user_message or "").strip():
+    if not session_id or not (user_message or "").strip():
+        metric("miss", session=session_id or "",
+               why="no_session" if not session_id else "empty_message")
         return None
     window = WINDOW if window is None else window
     announce = ANNOUNCE if announce is None else announce
     cross = CROSS if cross is None else cross
+    t0 = time.perf_counter()
+    turn = _next_turn(session_id) if METRICS else 0
+    diag: dict = {}
     try:
         idx = index_for(session_id, source)
+        if QUIET:
+            # documented meaning of ``quiet``: build the index, inject nothing.
+            metric("miss", session=session_id, why="quiet", turn=turn,
+                   turns=idx["n"] if idx else 0,
+                   ms=round((time.perf_counter() - t0) * 1000, 1))
+            return None
         if not idx and not cross:
+            metric("miss", session=session_id, why="no_index", turn=turn,
+                   ms=round((time.perf_counter() - t0) * 1000, 1))
             return None
 
         def reader(mid: int, owner: str = None) -> str:
@@ -811,6 +1308,7 @@ def recall(
                     f"around_message_id={mid}, window={window})")
 
         lines = []
+        ptrs = []
         if idx and announce and _announced.get(session_id, 0) < idx["hi"]:
             _announced[session_id] = idx["hi"]
             lines.append(
@@ -818,9 +1316,12 @@ def recall(
                 f"kept verbatim in the store (ids {idx['lo']}-{idx['hi']}) — any span is "
                 f"readable with {reader(idx['lo'])}."
             )
+            ptrs.append({"o": session_id, "lo": idx["lo"], "hi": idx["hi"],
+                         "tier": "announce", "terms": []})
 
         qwords = len(set(tokens(user_message)))
-        for mid, _sc, terms, tier, _cov in (match(idx, user_message) if idx else []):
+        hits = match(idx, user_message, diag=diag if METRICS_SHADOW else None) if idx else []
+        for mid, _sc, terms, tier, _cov in hits:
             role, ask = idx["preview"].get(mid, ("", ""))
             start = max(idx["lo"], mid - 2)
             span = f"ids {start}-{min(idx['hi'], mid + 3)}"
@@ -838,13 +1339,43 @@ def recall(
                 body += f' — {who}: "{ask}"'
             body += f" -> {reader(start)}"
             lines.append(body)
+            ptrs.append({"o": session_id, "lo": start,
+                         "hi": min(idx["hi"], mid + 3), "tier": tier,
+                         "terms": sorted(terms)[:5]})
 
         if cross:
-            lines.extend(_cross_lines(session_id, user_message, reader, qwords,
-                                      cross_db or getattr(source, "path", None)))
+            clines, cptrs = _cross_lines(session_id, user_message, reader, qwords,
+                                         cross_db or getattr(source, "path", None))
+            lines.extend(clines)
+            ptrs.extend(cptrs)
 
-        return {"context": "\n".join(lines)} if lines else None
+        if not lines:
+            metric("miss", session=session_id, why="no_match", turn=turn,
+                   turns=idx["n"] if idx else 0,
+                   diag=diag if METRICS_SHADOW else None,
+                   ms=round((time.perf_counter() - t0) * 1000, 1))
+            return None
+        text = "\n".join(lines)
+        fire = "%s#%d" % (session_id, turn)
+        if METRICS:
+            metric("fire", session=session_id, turn=turn, fire=fire,
+                   ptr=len(ptrs),
+                   strict=len([p for p in ptrs if p["tier"] == "strict"]),
+                   loose=len([p for p in ptrs if p["tier"] == "loose"]),
+                   same=len([p for p in ptrs if p["o"] == session_id]),
+                   cross=len([p for p in ptrs if p["o"] != session_id]),
+                   tokens=max(1, len(text) // 4), chars=len(text),
+                   turns=idx["n"] if idx else 0,
+                   diag=diag if METRICS_SHADOW else None,
+                   terms=[t for p in ptrs for t in p["terms"]][:8]
+                   if METRICS_TERMS else None,
+                   ptrs=ptrs, ms=round((time.perf_counter() - t0) * 1000, 1))
+            _add_pending(session_id, fire, turn,
+                         [[p["o"], p["lo"], p["hi"]] for p in ptrs])
+        return {"context": text}
     except Exception:
+        metric("miss", session=session_id, why="error", turn=turn,
+               ms=round((time.perf_counter() - t0) * 1000, 1))
         return None
 
 
@@ -852,10 +1383,10 @@ def _cross_lines(session_id: str, user_message: str, reader, qwords: int, db_pat
     """Foreign pointers, cooled down so one old session cannot nag on every turn."""
     try:
         if not db_path:
-            return []
+            return [], []
         hits = cross_hits(session_id, user_message, db_path=db_path)
         if not hits:
-            return []
+            return [], []
         words = list(dict.fromkeys(tokens(user_message)))
         kmap = {}
         for w in words:
@@ -867,7 +1398,7 @@ def _cross_lines(session_id: str, user_message: str, reader, qwords: int, db_pat
             _cross_turn[session_id] = turn
         if len(_cross_seen) > 4096:
             _cross_seen.clear()
-        out = []
+        out, ptrs = [], []
         for hit in hits:
             key = (session_id, hit["session_id"])
             last = _cross_seen.get(key)
@@ -875,9 +1406,11 @@ def _cross_lines(session_id: str, user_message: str, reader, qwords: int, db_pat
                 continue
             _cross_seen[key] = turn
             out.append(_cross_line(hit, reader, words, kmap))
-        return out
+            ptrs.append({"o": hit["session_id"], "lo": hit["lo"], "hi": hit["hi"],
+                         "tier": "loose", "terms": list(hit["terms"])[:5]})
+        return out, ptrs
     except Exception:
-        return []
+        return [], []
 
 
 def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs):
@@ -897,6 +1430,10 @@ def register(ctx) -> None:
     configure(settings_from_context(ctx))
     ctx.register_hook("pre_llm_call", recall)
     ctx.register_hook("post_compaction", on_post_compaction)
+    # post_tool_call is what makes the usefulness metric possible: it is the only
+    # place where a pointer is provably followed, because the agent's read of a named
+    # span arrives here as a session_search carrying around_message_id.
+    ctx.register_hook("post_tool_call", on_tool_call)
 
 
 # ---------------------------------------------------------------- cli
@@ -904,6 +1441,19 @@ def register(ctx) -> None:
 def _main(argv) -> int:
     cmd = argv[1] if len(argv) > 1 else "sessions"
     src = hermes_source()
+    if cmd in ("report", "metrics", "r"):
+        days = 30
+        for a in argv[2:]:
+            try:
+                days = int(a)
+            except ValueError:
+                pass
+        rep = report(days)
+        if "--json" in argv:
+            print(json.dumps(rep, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(format_report(rep))
+        return 0
     if cmd == "sessions":
         path = getattr(src, "path", None)
         if not path or not os.path.exists(path):

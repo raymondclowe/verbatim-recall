@@ -270,6 +270,11 @@ flat keys.
 | `cross_session.pool` | `400` | candidate turns pulled from the FTS index before re-scoring |
 | `cross_session.max_terms` | `12` | query words used for the foreign fingerprint match |
 | `cross_session.cooldown` | `6` | turns before the same foreign session may be pointed at again |
+| `metrics.enabled` | `true` | write one JSON line per turn to the event log |
+| `metrics.path` | `""` = `<hermes home>/logs/verbatim-recall` | where the day files live |
+| `metrics.retention_days` | `30` | day files older than this are deleted |
+| `metrics.store_terms` | `true` | keep matched query words; message bodies are never written |
+| `metrics.shadow_knobs` | `true` | also record what the gates threw away (false-negative watch) |
 
 **Too many weak pointers?** Raise `coverage` to 0.55, then `min_score`.
 Widen `boiler_df` if your region is small. **Missing things?** Lower
@@ -302,6 +307,44 @@ not deploying it — plugin modules are imported once at start.
 
 ---
 
+## Measuring it (the plugin reports on itself)
+
+Whether recall *helps* is not a matter of opinion, and it is not measured by the fact that it
+fires. Every turn appends one JSON line describing what was injected, and every time the agent
+reads a named span back a second event records that too. `vr_stats.py` turns the log into a
+headline, a detail table, and drill-downs:
+
+```bash
+python vr_stats.py --days 30                     # headline + summary table
+python vr_stats.py --since 2026-11-01 --until 2026-11-23
+python vr_stats.py --detail days|sessions|fires|misses|terms|all --limit 20
+python vr_stats.py --json                        # raw aggregate, for your own tooling
+```
+
+Exit `0` = data, exit `3` = the log is empty or nothing landed in that window. The log lives at
+`<hermes home>/logs/verbatim-recall/events-YYYY-MM-DD.jsonl`, one file per day, pruned by
+`metrics.retention_days`.
+
+The two numbers that matter:
+
+* **firing rate** — share of turns that received a pointer. High is not automatically good.
+* **read-back rate** — share of pointers the agent actually opened with `session_search`.
+  Firing 100% with read-back ~0 means the pointers are being injected and ignored, which is
+  the failure worth fixing; the firing rate alone would hide it.
+
+Two honesty rules are built into the report, because the obvious numbers lie:
+
+1. Rows written by `vr_replay.py` are tagged `src="replay"`, and the tool prints a `NOTE` when a
+   window contains them. A replay reproduces real messages through the real gate, but it is not
+   live traffic — do not read it as such.
+2. Read-back that cannot be measured prints **`n/a - not measured`**, never `0%`. A replay cannot
+   observe whether the agent opened a pointer; only live turns emit that event.
+
+`vr_replay.py 60` replays the last 60 real user turns of a session through the real recall path.
+Use it when a log is empty and you want the report to have shape — with the caveat printed.
+
+---
+
 ## Limits, honestly
 
 * lexical (token + IDF) matching — no synonyms, no paraphrase, no cross-language recall.
@@ -322,6 +365,9 @@ not deploying it — plugin modules are imported once at start.
 * the archive's coherence is the framework's job; if rows are missing, pointers are missing.
 * no reranking of the matched span's content: the top-1 id is chosen by the gate, not by a
   second model pass.
+* metrics observe reads that go through the framework's `session_search` path with an id span;
+  a read done another way (opening the DB by hand, a different tool) is invisible to read-back,
+  so `n/a - not measured` and `0%` are not the same claim.
 
 ## License
 
