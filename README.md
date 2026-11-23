@@ -105,13 +105,14 @@ Four properties make that pointer trustworthy enough to inject:
 | **It shows the opening of the span** (`— opens: "…"`) | one line lets the model judge relevance without spending a read |
 
 Cost: one scoped FTS pass plus a re-score. Measured on a 4 GB `state.db` (846k max
-message id, 677k rows), warm, over 10 realistic queries: **147 ms mean, 127 ms
-median, 342 ms max per turn** with the cross pass on, against ~19 ms for the local
-pass. The cost is bimodal — the `capped-or` rung is 16–28 ms, while the `all-or`
-fallback is 227–342 ms warm and 0.6–1.1 s cold. It is set by how many rows the
-query's commonest word matches, not by the code. **0 bytes injected on a miss**, and
-a cooldown (`cross_session.cooldown`, 6 turns per foreign session) so the same old
-session cannot be re-advertised every turn.
+message id, 677k rows), warm, over 10 realistic queries: **120 ms mean, 25 ms
+median, 340 ms max per turn** with the cross pass on, against 3.7 ms to build the
+local index and 0.01 ms per match with it off. The cost is bimodal — the
+`capped-or` rung is 16–28 ms, while the `all-or` fallback is 227–342 ms warm and
+0.6–1.1 s cold. It is set by how many rows the query's commonest word matches, not
+by the code. **0 bytes injected on a miss**, and a cooldown
+(`cross_session.cooldown`, 6 turns per foreign session) so the same old session
+cannot be re-advertised every turn.
 
 ### Who is in scope
 
