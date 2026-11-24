@@ -80,6 +80,12 @@ opening hours close closed com www http https site_name value values name title 
 stale refresh rebuild rewrite replace rework verify audit improve expand correct delete remove
 add move sync clean prune sweep recheck rename publish deploy migrate convert
 fee ticket restaurant restaurants hotel hotels
+# tool and harness vocabulary: it names the machinery around the work, never the subject
+unit units batch batches async background delegation notification command commands output
+built build cache scratch proc exit code codes jsonl token tokens debug log logs test tests
+pytest commit commits branch merge diff script scripts python shell system note notes summary
+summaries context prompt prompts session sessions turn turns agent agents subagent subagents
+finished completed earlier previously again result results error errors failed failure stdout
 """.split())
 
 _DOMAIN = re.compile(r"\b([a-z0-9][a-z0-9-]{1,62})\.(com|hk|net|asia|tw|org|co|info|biz)\b")
@@ -326,12 +332,19 @@ def _score(root, files, words, nums, ident=""):
     hits = {}
     for rel, ts in found.items():
         # [score, terms matched, mtime, terms worth naming, terms that are not the site key]
-        h = hits.setdefault(rel, [0.0, 0, mtimes.get(rel, 0), [], set()])
+        # [score, terms matched, mtime, terms worth naming, non-site terms, rarest df
+        #  ratio, matched-a-row-number] -- the last two decide whether a match is
+        #  distinctive enough to rank on recency instead of on raw term count.
+        h = hits.setdefault(rel, [0.0, 0, mtimes.get(rel, 0), [], set(), 1.0, False])
         for w in ts:
             d = df.get(w, 1)
             weight = 0.2 if d > n * 0.6 else 1.0 + (1.0 - d / n)
             h[0] += weight
             h[1] += 1
+            if d / n < h[5]:
+                h[5] = d / n
+            if w in nums:
+                h[6] = True
             if w != ident:
                 h[4].add(w)
             if w in nums:
@@ -398,12 +411,36 @@ def _fmt_day(ts):
         return "undated"
 
 
+def _tier(h):
+    """2 = a row number or a rare word, 1 = a word carried by a minority of the site's
+    files, 0 = only vocabulary this site uses everywhere."""
+    if h[6]:
+        return 2
+    if h[5] <= 0.25:
+        return 1
+    return 0
+
+
+# System envelopes carry tool chatter, not work orders: a process id, a cache path, a
+# build log. Running the corpus against them produces confident pointers to nothing.
+_ENVELOPE = re.compile(
+    r"\[ASYNC DELEGATION|\[IMPORTANT:|\[INTERNAL NOTIFICATION|\[PRIOR CONTEXT|"
+    r"\[System note|\[OUT-OF-BAND|HERMES-CONTEXT-COMPRESSION|Gateway message origin|"
+    r"Background process \w+ completed|^\s*\[CONTEXT COMPACTION",
+    re.I,
+)
+
+
+def _is_envelope(msg):
+    return bool(_ENVELOPE.search(msg[:600]))
+
+
 def lookup(msg, top_k=3, idx=None):
     """Return ([line, ...], [{"path": rel, ...}, ...]) for the entities in `msg`."""
     if idx is None:
         idx = load()
     sites = idx.get("sites") or {}
-    if not msg or not sites:
+    if not msg or not sites or _is_envelope(msg):
         return [], []
     site_names, ent, nums = _entities(msg)
     keys = _match_sites(idx, site_names, ent)
@@ -428,7 +465,10 @@ def lookup(msg, top_k=3, idx=None):
             stem = rel.rsplit("/", 1)[-1].lower()
             if sum(1 for w in h[3] if w in stem) >= 2:
                 h[0] += 1.2
-        ranked = sorted(hits.items(), key=lambda kv: (-kv[1][0], -kv[1][2]))
+        # A big document that repeats the entity's words ten times is not a more recent
+        # record than the dated file written about it last week. Rank on how distinctive
+        # the match is, then on recency; volume only breaks ties.
+        ranked = sorted(hits.items(), key=lambda kv: (-_tier(kv[1]), -kv[1][2], -kv[1][0]))
         best, meta = ranked[0]
         if meta[1] < 2 and not any(w in nums for w in meta[3]):
             # one shared word is not evidence of the same entity -- unless that word is the

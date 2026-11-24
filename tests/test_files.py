@@ -117,6 +117,41 @@ class FileCorpusTest(unittest.TestCase):
         self.assertIn("read it before changing anything", lines[0])
         self.assertIn("newest", lines[0])
 
+    def test_volume_does_not_beat_recency(self):
+        # the real failure this guards: a long older document that repeats the venue ten
+        # times outranked the dated file written about it last week, because ranking was
+        # on term count. Recency has to win once the match is distinctive.
+        big = os.path.join(self.root, "sites", "trail-ridge-road", "findings",
+                           "2026-10-01-season-research.md")
+        with open(big, "w") as fh:
+            fh.write(("Daven Haven Lodge opening hours and price notes.\n" * 10))
+        old = time.time() - 86400 * 40
+        os.utime(big, (old, old))
+        idx = vr_files.build(roots=[self.root], path=self.index_path)
+        _lines, refs = vr_files.lookup(
+            "fix the price of Daven Haven Lodge, trail-ridge-road.com row 1589", idx=idx
+        )
+        self.assertNotEqual(refs[0]["path"], "sites/trail-ridge-road/findings/"
+                           "2026-10-01-season-research.md")
+
+    def test_system_envelope_gets_no_pointer(self):
+        # tool chatter carries paths and process ids, not work: matching the corpus against
+        # it produced confident pointers to unrelated files.
+        for msg in (
+            "[IMPORTANT: Background process proc_6942395 completed normally (exit code 0)]\n"
+            "Command: cd /home/wlmedia/.hermes/cache/scratch && python3 vr_files.py build",
+            "[ASYNC DELEGATION BATCH COMPLETE — deleg_9ac9b22f] 1 subagent finished",
+            "[OUT-OF-BAND USER MESSAGE] the davens haven price is wrong on trail-ridge-road",
+        ):
+            self.assertEqual(vr_files.lookup(msg, idx=self.idx), ([], []), msg[:40])
+
+    def test_harness_vocabulary_is_not_entity_evidence(self):
+        # "unit", "results", "batch" name the machinery around the work, not the venue
+        for w in ("unit", "results", "batch", "background"):
+            self.assertIn(w, vr_files.STOP)
+        lines, _ = vr_files.lookup("batch unit results trail-ridge-road.com", idx=self.idx)
+        self.assertFalse([l for l in lines if "file record for" in l], lines)
+
     # ---- robustness --------------------------------------------------------
     def test_missing_root_never_raises(self):
         idx = vr_files.build(roots=[os.path.join(self.tmp, "nope")], path=self.index_path)
