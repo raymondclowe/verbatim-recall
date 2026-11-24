@@ -134,6 +134,7 @@ def main(argv=None):
         ("  strict / low-confidence",
          "%d / %d" % (rep["pointer_tiers"]["strict"],
                       rep["pointer_tiers"]["low_confidence"])),
+        ("  from the file corpus", rep["pointer_tiers"].get("files", 0)),
         ("  same / other session",
          "%d / %d" % (rep["pointer_origins"]["same_session"],
                       rep["pointer_origins"]["other_session"])),
