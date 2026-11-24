@@ -146,6 +146,51 @@ therefore sees no foreign rows at all; fix the stamp upstream if that is the cas
 
 ---
 
+## The file corpus (on by default)
+
+Session search answers "what did we say", and it is silent on the turn that has no
+own transcript — a subagent's first turn, a card picked up by a fresh session, a
+cron job. The file corpus answers **"what is already on disk about this exact thing"**,
+out of the dated records themselves, and works on turn one.
+
+Two layers, because they cost different things:
+
+- **path index** — one walk of `files.roots` (default `<hermes home>/wl-knowledge` and
+  `./wl-knowledge`), no file reads. Maps a site key to its files with mtimes:
+  68,583 files, 195 site keys, **7.0 MB** JSON, **1.3 s** to build, refreshed in the
+  background at most every `files.refresh_hours` (6).
+- **body search** — per lookup, mechanical: `ripgrep` (a plain Python scan when ripgrep
+  is not installed) over that one site's own files for the words the work order is
+  actually about — venue name, row number, page slug. Nothing is cached to disk.
+
+A pointer is one line, ~76 tokens of context:
+
+```
+[verbatim-recall] file record for trail-ridge-road: newest 2026-11-22 19:21 HKT — sites/trail-ridge-road/findings/2026-11-22-daven-haven-1589-field-fill.md (matched: lodge, 1589, trail-ridge-road, haven, daven; +183 more matching files) — read it before changing anything it names.
+```
+
+Rules that keep it honest:
+
+| Rule | Why |
+|---|---|
+| **Site-scoped first** | a hotel name is ambiguous across the estate and unambiguous inside one site. No site named, no search. |
+| **Ranked by the entity's own words, newest first** | `daven haven lodge` + `1589` beats a file that merely repeats the site name; the row number is the narrowest handle there is. |
+| **A filename counts as evidence** | `2026-11-22-daven-haven-1589-field-fill.md` names the entity without being opened. |
+| **One shared word is not a match** | two agreeing terms, or the site key itself, or silence. |
+| **A site-only pointer says so** | when the order names no entity inside the site, the line reads `latest file on <site>` and says no word matched beyond the site name — it never dresses a guess up as a match. |
+| **No entity, no pointer** | "continue the work", "sweep the estate" return nothing rather than a guess. |
+| **Advisory only** | it prints a line; it never blocks, gates or reorders the work. |
+
+Cost, measured on a 68,583-file corpus over 30 realistic work orders: **23 ms mean,
+17 ms median, 65 ms max** per lookup with the index warm, and **0.13 s** end to end in
+a fresh process (interpreter start included) for the first turn of a new session. A
+stale index costs an older date, never a wrong pointer.
+
+Why a search and not an index: an earlier revision tokenised every file once per site and
+cached the result. It was 33 ms and 754 MB on this corpus — ripgrep over the same files
+answers in 23 ms and stores nothing, which is the better trade for a line that is read
+once at the top of a turn.
+
 ## Install
 
 Single file, stdlib only, Python 3.9+. Pick the row that matches your host.
